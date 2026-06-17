@@ -1,8 +1,8 @@
 {
   "$schema": "https://cdn.tauri.app/v2/schemas/2.0.0/config.json",
-  "productName": "SiteVault",
+  "productName": "Crasp",
   "version": "0.1.0",
-  "identifier": "com.sitevault.app",
+  "identifier": "com.crasp.app",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "SiteVault - Web Archiver",
+        "title": "Crasp - Web Archiver",
         "width": 1280,
         "height": 800,
         "minWidth": 900,

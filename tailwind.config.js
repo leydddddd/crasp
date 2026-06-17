@@ -4,7 +4,7 @@ export default {
   theme: {
     extend: {
       colors: {
-        vault: {
+        crasp: {
           50: "#f0f4ff",
           100: "#dbe4ff",
           200: "#bac8ff",

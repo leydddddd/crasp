@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -12,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::sync::{mpsc, watch};
 use url::Url;
+
+use phf::phf_set;
 
 use crate::commands::TauriEmitter;
 
@@ -92,8 +93,8 @@ pub struct CrawlControl {
     cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
+#[allow(dead_code)]
 impl CrawlControl {
-    #[allow(dead_code)]
     pub fn new() -> Self {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (pause_tx, pause_rx) = watch::channel(false);
@@ -154,7 +155,7 @@ pub struct Crawler {
 impl Crawler {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
-            .user_agent("SiteVault/0.1 (archiver; +https://sitevault.app)")
+            .user_agent("Crasp/0.1 (archiver; +https://crasp.app)")
             .gzip(true)
             .brotli(true)
             .deflate(true)
@@ -198,12 +199,14 @@ impl Crawler {
         let client = self.client;
         let semaphore = Arc::new(tokio::sync::Semaphore::new(config.concurrency));
         let cancelled_flag = cancelled.clone();
-        let control_paused = control.paused.clone();
 
         let (done_tx, mut done_rx) = mpsc::channel::<WorkerOutput>(1000);
 
         let cfg_worker = config.clone();
         let emitter_worker = emitter.clone();
+
+        let mut worker_cancel_rx = control.cancel_rx();
+        let worker_pause_rx = control.pause_rx();
 
         let worker_loop = {
             let done_tx = done_tx.clone();
@@ -220,8 +223,8 @@ impl Crawler {
                                 None => break,
                             }
                         }
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
-                            if cancelled_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        _ = worker_cancel_rx.changed() => {
+                            if *worker_cancel_rx.borrow() {
                                 break;
                             }
                             continue;
@@ -236,6 +239,34 @@ impl Crawler {
                         Ok(p) => p,
                         Err(_) => break,
                     };
+
+                    if cancelled_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+
+                    let mut pause_rx = worker_pause_rx.clone();
+                    if *pause_rx.borrow() {
+                        loop {
+                            tokio::select! {
+                                _ = pause_rx.changed() => {
+                                    if !*pause_rx.borrow() {
+                                        break;
+                                    }
+                                }
+                                _ = tokio::task::yield_now() => {
+                                    if cancelled_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                                        break;
+                                    }
+                                    if !*pause_rx.borrow() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if cancelled_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                    }
 
                     if cancelled_flag.load(std::sync::atomic::Ordering::SeqCst) {
                         break;
@@ -263,7 +294,6 @@ impl Crawler {
         let i_domain = domain.clone();
         let i_scheme = scheme.clone();
         let i_emitter = emitter.clone();
-        let i_paused = control_paused.clone();
         let i_cancelled = cancelled_flag.clone();
 
         let collector = tokio::spawn(async move {
@@ -273,10 +303,6 @@ impl Crawler {
                 let _ = result_tx.send(archived.clone()).await;
 
                 if i_cancelled.load(std::sync::atomic::Ordering::SeqCst) {
-                    continue;
-                }
-
-                if i_paused.load(std::sync::atomic::Ordering::SeqCst) {
                     continue;
                 }
 
@@ -300,18 +326,11 @@ impl Crawler {
                         }
 
                         let should_inject = {
-                            if i_visited.contains(&key) {
-                                continue;
-                            }
                             let current = i_pages_count.load(std::sync::atomic::Ordering::SeqCst);
                             if current >= i_max_pages {
                                 continue;
                             }
-                            let inserted = !i_visited.contains(&key);
-                            if inserted {
-                                i_visited.insert(key);
-                            }
-                            inserted
+                            i_visited.insert(key)
                         };
 
                         if should_inject {
@@ -334,12 +353,32 @@ impl Crawler {
             }
         });
 
+        drop(work_tx);
+        drop(done_tx);
+
         let mut results: Vec<ArchivedPage> = Vec::new();
         let emitter_result = emitter.clone();
         let mut cancel_rx = control.cancel_rx();
         let mut pause_rx = control.pause_rx();
 
         loop {
+            if *pause_rx.borrow() {
+                tokio::select! {
+                    _ = pause_rx.changed() => {
+                        if !*pause_rx.borrow() {
+                            continue;
+                        }
+                    }
+                    _ = cancel_rx.changed() => {
+                        if *cancel_rx.borrow() {
+                            cancelled_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+
             tokio::select! {
                 page = result_rx.recv() => {
                     match page {
@@ -358,46 +397,13 @@ impl Crawler {
                 }
                 _ = pause_rx.changed() => {
                     if *pause_rx.borrow() {
-                        loop {
-                            tokio::select! {
-                                page = result_rx.recv() => {
-                                    match page {
-                                        Some(p) => {
-                                            let _ = emitter_result.emit("archive-success", &serde_json::to_value(&p).unwrap_or_default()).await;
-                                            results.push(p);
-                                        }
-                                        None => break,
-                                    }
-                                }
-                                _ = cancel_rx.changed() => {
-                                    if *cancel_rx.borrow() {
-                                        cancelled_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                                        break;
-                                    }
-                                }
-                                _ = pause_rx.changed() => {
-                                    if !control_paused.load(std::sync::atomic::Ordering::SeqCst) {
-                                        break;
-                                    }
-                                }
-                                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
-                                    if !control_paused.load(std::sync::atomic::Ordering::SeqCst) {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if cancelled_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                            break;
-                        }
+                        continue;
                     }
                 }
             }
         }
 
         cancelled_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-
-        drop(work_tx);
 
         worker_loop.abort();
         collector.abort();
@@ -474,13 +480,20 @@ async fn process_page(
     })).await;
 
     let (title, links, extracted) = {
-        let document = Html::parse_document(&html_text);
+        let html_text = html_text.clone();
+        let url_for_links = url_str.clone();
+        let css_selectors = config.css_selectors.clone();
+        let preserve_html = config.preserve_html;
 
-        let title = extract_title(&document);
-        let links = extract_links(&document, &url_str);
-        let extracted = extract_and_sanitize(&document, &config.css_selectors, config.preserve_html);
-
-        (title, links, extracted)
+        tokio::task::spawn_blocking(move || {
+            let document = Html::parse_document(&html_text);
+            let title = extract_title(&document);
+            let links = extract_links(&document, &url_for_links);
+            let extracted = extract_and_sanitize(&document, &css_selectors, preserve_html);
+            (title, links, extracted)
+        })
+        .await
+        .unwrap_or_else(|_| (String::new(), vec![], String::new()))
     };
 
     if title.is_empty() {
@@ -599,36 +612,37 @@ fn select_content<'a>(document: &'a Html, selectors: &[String]) -> Vec<scraper::
     vec![]
 }
 
-static STRIP_TAGS: &[&str] = &[
+static STRIP_SET: phf::Set<&'static str> = phf_set! {
     "script", "style", "noscript", "iframe", "object", "embed",
     "applet", "form", "input", "button", "select", "textarea",
     "svg", "canvas",
-];
+};
 
-static VOID_TAGS: &[&str] = &[
+static VOID_SET: phf::Set<&'static str> = phf_set! {
     "br", "hr", "img", "input", "meta", "link",
-];
+};
 
-static TRACKING_ATTRS: &[&str] = &[
+static TRACKING_SET: phf::Set<&'static str> = phf_set! {
     "onclick", "onload", "onerror", "onmouseover", "onmouseout",
     "onmousedown", "onmouseup", "onkeydown", "onkeyup", "onfocus",
     "onblur", "onsubmit", "onchange", "data-tracking", "data-ad",
     "data-analytics", "data-pixel",
-];
+};
 
 struct TagSets {
-    strip: HashSet<&'static str>,
-    void_tags: HashSet<&'static str>,
-    tracking: HashSet<&'static str>,
+    strip: &'static phf::Set<&'static str>,
+    void_tags: &'static phf::Set<&'static str>,
+    tracking: &'static phf::Set<&'static str>,
 }
 
 impl TagSets {
-    fn new() -> Self {
-        Self {
-            strip: STRIP_TAGS.iter().copied().collect(),
-            void_tags: VOID_TAGS.iter().copied().collect(),
-            tracking: TRACKING_ATTRS.iter().copied().collect(),
-        }
+    fn global() -> &'static Self {
+        static INSTANCE: OnceLock<TagSets> = OnceLock::new();
+        INSTANCE.get_or_init(|| TagSets {
+            strip: &STRIP_SET,
+            void_tags: &VOID_SET,
+            tracking: &TRACKING_SET,
+        })
     }
 
     fn is_strip(&self, tag: &str) -> bool {
@@ -645,7 +659,7 @@ impl TagSets {
 }
 
 fn sanitize_to_html(elements: &[scraper::ElementRef]) -> String {
-    let sets = TagSets::new();
+    let sets = TagSets::global();
     let mut output = String::new();
 
     for el in elements {
@@ -688,7 +702,7 @@ fn render_node_html(node_ref: &NodeRef<Node>, sets: &TagSets) -> String {
 }
 
 fn sanitize_to_text(elements: &[scraper::ElementRef]) -> String {
-    let sets = TagSets::new();
+    let sets = TagSets::global();
     let mut output = Vec::new();
 
     for el in elements {

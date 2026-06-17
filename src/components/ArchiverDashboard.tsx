@@ -26,7 +26,7 @@ export function ArchiverDashboard() {
 
   const statusColor: Record<ArchiveStatus, string> = {
     idle: "bg-gray-600",
-    crawling: "bg-vault-600 animate-pulse",
+    crawling: "bg-crasp-600 animate-pulse",
     paused: "bg-amber-500",
     completed: "bg-emerald-500",
     error: "bg-red-500",
@@ -60,8 +60,8 @@ export function ArchiverDashboard() {
       {/* Header */}
       <header className="flex items-center justify-between border-b border-gray-800 px-4 py-2.5">
         <div className="flex items-center gap-3">
-          <Database className="h-5 w-5 text-vault-400" />
-          <h1 className="text-lg font-semibold tracking-tight">SiteVault</h1>
+          <Database className="h-5 w-5 text-crasp-400" />
+          <h1 className="text-lg font-semibold tracking-tight">Crasp</h1>
           <div
             className={`ml-3 flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium ${
               statusColor[archiver.status]
@@ -208,7 +208,7 @@ export function ArchiverDashboard() {
                       }))
                     }
                     disabled={archiver.status !== "idle"}
-                    className="w-full rounded-md border border-gray-700 bg-gray-800 px-2.5 py-1.5 text-xs text-gray-200 focus:border-vault-500 focus:outline-none disabled:opacity-50"
+                    className="w-full rounded-md border border-gray-700 bg-gray-800 px-2.5 py-1.5 text-xs text-gray-200 focus:border-crasp-500 focus:outline-none disabled:opacity-50"
                   >
                     <option value="sha256">SHA-256</option>
                     <option value="md5">MD5</option>
@@ -241,7 +241,7 @@ export function ArchiverDashboard() {
                   disabled={archiver.status !== "idle"}
                   className={`relative h-4 w-8 rounded-full transition-colors disabled:opacity-50 ${
                     archiver.config.preserve_html
-                      ? "bg-vault-600"
+                      ? "bg-crasp-600"
                       : "bg-gray-700"
                   }`}
                 >
@@ -263,7 +263,7 @@ export function ArchiverDashboard() {
               <button
                 onClick={handleStart}
                 disabled={!archiver.config.seed_url.trim()}
-                className="mt-4 flex w-full items-center justify-center gap-2 rounded-md bg-vault-600 px-4 py-2 text-sm font-semibold text-white hover:bg-vault-500 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                className="mt-4 flex w-full items-center justify-center gap-2 rounded-md bg-crasp-600 px-4 py-2 text-sm font-semibold text-white hover:bg-crasp-500 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 <Play className="h-4 w-4" />
                 Start Archiving
@@ -279,7 +279,7 @@ export function ArchiverDashboard() {
             </h2>
             <div className="grid grid-cols-2 gap-2">
               <StatCard
-                icon={<Globe className="h-4 w-4 text-vault-400" />}
+                icon={<Globe className="h-4 w-4 text-crasp-400" />}
                 label="Discovered"
                 value={archiver.stats.discovered}
               />
@@ -315,7 +315,7 @@ export function ArchiverDashboard() {
                 </div>
                 <div className="h-1.5 overflow-hidden rounded-full bg-gray-800">
                   <div
-                    className="h-full rounded-full bg-vault-600 transition-all duration-300"
+                    className="h-full rounded-full bg-crasp-600 transition-all duration-300"
                     style={{
                       width: `${Math.min(
                         100,
@@ -350,7 +350,7 @@ export function ArchiverDashboard() {
                   key={p.url}
                   className="shrink-0 flex items-center gap-1 rounded-full bg-gray-800 px-2 py-0.5 text-[11px]"
                 >
-                  <span className="h-1.5 w-1.5 rounded-full bg-vault-400 animate-pulse" />
+                  <span className="h-1.5 w-1.5 rounded-full bg-crasp-400 animate-pulse" />
                   <span className="max-w-[120px] truncate text-gray-400">
                     {p.url.replace(/^https?:\/\//, "").slice(0, 30)}
                   </span>
@@ -360,7 +360,7 @@ export function ArchiverDashboard() {
                         ? "text-blue-400"
                         : p.status === "scraping"
                           ? "text-amber-400"
-                          : "text-vault-400"
+                          : "text-crasp-400"
                     }`}
                   >
                     {p.status}
@@ -429,7 +429,7 @@ export function ArchiverDashboard() {
                         {page.discovered_links} links
                       </span>
                       {page.hash && (
-                        <span className="hidden shrink-0 items-center gap-1 text-[11px] text-vault-400/60 xl:flex">
+                        <span className="hidden shrink-0 items-center gap-1 text-[11px] text-crasp-400/60 xl:flex">
                           <Hash className="h-3 w-3" />
                           {page.hash.slice(0, 12)}
                         </span>
@@ -469,7 +469,7 @@ function PageStatusIcon({ status }: { status: PageStatus }) {
     status === "Archiving"
   ) {
     return (
-      <div className="h-4 w-4 shrink-0 rounded-full border-2 border-vault-400 animate-pulse" />
+      <div className="h-4 w-4 shrink-0 rounded-full border-2 border-crasp-400 animate-pulse" />
     );
   }
   if (typeof status === "object" && "Failed" in status) {
@@ -580,7 +580,7 @@ function InputField({
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
         disabled={disabled}
-        className="w-full rounded-md border border-gray-700 bg-gray-800 px-2.5 py-1.5 text-xs text-gray-200 placeholder-gray-600 focus:border-vault-500 focus:outline-none disabled:opacity-50"
+        className="w-full rounded-md border border-gray-700 bg-gray-800 px-2.5 py-1.5 text-xs text-gray-200 placeholder-gray-600 focus:border-crasp-500 focus:outline-none disabled:opacity-50"
       />
     </div>
   );

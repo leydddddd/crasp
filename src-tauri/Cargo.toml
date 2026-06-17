@@ -1,10 +1,10 @@
 [package]
-name = "sitevault"
+name = "crasp"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "sitevault_lib"
+name = "crasp_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -14,7 +14,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["gzip", "brotli", "deflate"] }
+reqwest = { version = "0.12", features = ["gzip", "brotli", "deflate", "json"] }
 scraper = "0.22"
 sha2 = "0.10"
 md-5 = "0.10"
@@ -26,6 +26,10 @@ serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 ego-tree = "0.10"
 dashmap = "6"
+phf = { version = "0.11", features = ["macros"] }
+parking_lot = "0.12"
+mongodb = { version = "3", features = ["compat-3-3-0"] }
+bson = "2"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(mobile)"] }

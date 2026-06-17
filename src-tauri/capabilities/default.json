@@ -1,6 +1,6 @@
 {
   "identifier": "default",
-  "description": "Default capability for SiteVault",
+  "description": "Default capability for Crasp",
   "windows": ["main"],
   "permissions": [
     "core:default",

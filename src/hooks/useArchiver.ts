@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import type {
@@ -24,9 +24,8 @@ export function useArchiver() {
     skipped: 0,
     discovered: 0,
   });
-  const [progressMap, setProgressMap] = useState<
-    Map<string, ScrapeProgressPayload>
-  >(new Map());
+  const [progressRev, bumpProgress] = useReducer((c: number) => c + 1, 0);
+  const progressMapRef = useRef<Map<string, ScrapeProgressPayload>>(new Map());
   const [error, setError] = useState<string | null>(null);
   const [config, setConfig] = useState<CrawlConfig>({
     seed_url: "",
@@ -49,11 +48,8 @@ export function useArchiver() {
       const u1 = await listen<ScrapeProgressPayload>(
         "scrape-progress",
         (event) => {
-          setProgressMap((prev) => {
-            const next = new Map(prev);
-            next.set(event.payload.url, event.payload);
-            return next;
-          });
+          progressMapRef.current.set(event.payload.url, event.payload);
+          bumpProgress();
         }
       );
       if (cancelled) {
@@ -96,11 +92,8 @@ export function useArchiver() {
             else if (isSkipped(page.status)) next.skipped++;
             return next;
           });
-          setProgressMap((prev) => {
-            const next = new Map(prev);
-            next.delete(page.url);
-            return next;
-          });
+          progressMapRef.current.delete(page.url);
+          bumpProgress();
         }
       );
       if (cancelled) {
@@ -133,16 +126,17 @@ export function useArchiver() {
   }, []);
 
   const progress = useMemo(
-    () => Array.from(progressMap.values()),
-    [progressMap]
+    () => Array.from(progressMapRef.current.values()),
+    [progressRev]
   );
 
   const startCrawl = useCallback(async () => {
     pageMap.current.clear();
     discoveredSet.current.clear();
+    progressMapRef.current.clear();
+    bumpProgress();
     setPages([]);
     setStats({ total: 0, completed: 0, failed: 0, skipped: 0, discovered: 0 });
-    setProgressMap(new Map());
     setError(null);
     setStatus("crawling");
 
@@ -183,9 +177,10 @@ export function useArchiver() {
   const resetCrawl = useCallback(() => {
     pageMap.current.clear();
     discoveredSet.current.clear();
+    progressMapRef.current.clear();
+    bumpProgress();
     setPages([]);
     setStats({ total: 0, completed: 0, failed: 0, skipped: 0, discovered: 0 });
-    setProgressMap(new Map());
     setError(null);
     setStatus("idle");
   }, []);
