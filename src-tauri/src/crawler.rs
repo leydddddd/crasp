@@ -1,12 +1,16 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use chrono::Utc;
-use md5::{Digest as Md5Digest, Md5};
-use scraper::{Html, Selector};
+use dashmap::DashSet;
+use digest::Digest;
+use ego_tree::NodeRef;
+use md5::Md5;
+use scraper::{Html, Node, Selector};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as Sha2Digest, Sha256};
-use tokio::sync::{Semaphore, watch};
+use sha2::Sha256;
+use tokio::sync::{mpsc, watch};
 use url::Url;
 
 use crate::commands::TauriEmitter;
@@ -67,6 +71,7 @@ pub struct ArchivedPage {
     pub timestamp: String,
 }
 
+#[allow(dead_code)]
 struct FrontierItem {
     url: String,
     depth: u32,
@@ -78,45 +83,33 @@ struct WorkerOutput {
     found_links: Vec<String>,
 }
 
-pub struct Crawler {
-    client: reqwest::Client,
+pub struct CrawlControl {
     cancel_tx: watch::Sender<bool>,
     cancel_rx: watch::Receiver<bool>,
     pause_tx: watch::Sender<bool>,
     pause_rx: watch::Receiver<bool>,
-    visited: Arc<tokio::sync::Mutex<HashSet<String>>>,
-    pages_count: Arc<std::sync::atomic::AtomicU32>,
     paused: Arc<std::sync::atomic::AtomicBool>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
-impl Crawler {
+impl CrawlControl {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (pause_tx, pause_rx) = watch::channel(false);
 
-        let client = reqwest::Client::builder()
-            .user_agent("SiteVault/0.1 (archiver; +https://sitevault.app)")
-            .gzip(true)
-            .brotli(true)
-            .deflate(true)
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("failed to build HTTP client");
-
         Self {
-            client,
             cancel_tx,
             cancel_rx,
             pause_tx,
             pause_rx,
-            visited: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
-            pages_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
     pub fn cancel(&self) {
+        self.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = self.cancel_tx.send(true);
     }
 
@@ -130,26 +123,71 @@ impl Crawler {
         let _ = self.pause_tx.send(false);
     }
 
+    pub fn reset(&self) {
+        self.cancelled.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.paused.store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.cancel_tx.send(false);
+        let _ = self.pause_tx.send(false);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn cancel_rx(&self) -> watch::Receiver<bool> {
+        self.cancel_rx.clone()
+    }
+
+    pub fn pause_rx(&self) -> watch::Receiver<bool> {
+        self.pause_rx.clone()
+    }
+}
+
+pub struct Crawler {
+    client: reqwest::Client,
+}
+
+impl Crawler {
+    pub fn new() -> Self {
+        let client = reqwest::Client::builder()
+            .user_agent("SiteVault/0.1 (archiver; +https://sitevault.app)")
+            .gzip(true)
+            .brotli(true)
+            .deflate(true)
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("failed to build HTTP client");
+
+        Self { client }
+    }
+
     pub async fn run(
-        &self,
+        self,
         config: CrawlConfig,
         emitter: TauriEmitter,
+        control: &CrawlControl,
     ) -> Result<Vec<ArchivedPage>, String> {
         let seed = Url::parse(&config.seed_url).map_err(|e| e.to_string())?;
         let domain = seed.domain().ok_or("seed URL has no domain")?.to_string();
         let scheme = seed.scheme().to_string();
 
-        self.reset_state().await;
+        let (work_tx, work_rx) = mpsc::channel::<FrontierItem>(config.max_pages as usize * 2);
+        let (result_tx, mut result_rx) = mpsc::channel::<ArchivedPage>(config.max_pages as usize * 2);
 
-        let (work_tx, work_rx) = tokio::sync::mpsc::channel::<FrontierItem>(config.max_pages as usize * 2);
-        let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<ArchivedPage>(config.max_pages as usize * 2);
+        let visited = Arc::new(DashSet::<String>::new());
+        let pages_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         {
             let key = normalize_url(&config.seed_url);
-            let mut v = self.visited.lock().await;
-            v.insert(key);
+            visited.insert(key);
         }
-        self.pages_count.store(1, std::sync::atomic::Ordering::SeqCst);
+        pages_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         let _ = work_tx.send(FrontierItem {
             url: config.seed_url.clone(),
@@ -157,35 +195,56 @@ impl Crawler {
             parent: None,
         }).await;
 
-        let semaphore = Arc::new(Semaphore::new(config.concurrency));
-        let client = self.client.clone();
-        let cfg = config.clone();
-        let visited = self.visited.clone();
-        let pages_count = self.pages_count.clone();
-        let paused = self.paused.clone();
-        let cancel_rx = self.cancel_rx.clone();
-        let pause_rx = self.pause_rx.clone();
+        let client = self.client;
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(config.concurrency));
+        let cancelled_flag = cancelled.clone();
+        let control_paused = control.paused.clone();
 
-        let worker_handle = tokio::spawn(async move {
-            let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<WorkerOutput>(1000);
+        let (done_tx, mut done_rx) = mpsc::channel::<WorkerOutput>(1000);
 
-            let w_client = client.clone();
-            let w_cfg = cfg.clone();
-            let w_emitter = emitter.clone();
-            let w_done_tx = done_tx.clone();
-            let w_semaphore = semaphore.clone();
+        let cfg_worker = config.clone();
+        let emitter_worker = emitter.clone();
 
-            let worker_loop = tokio::spawn(async move {
+        let worker_loop = {
+            let done_tx = done_tx.clone();
+            let semaphore = semaphore.clone();
+            let cancelled_flag = cancelled_flag.clone();
+
+            tokio::spawn(async move {
                 let mut rx = work_rx;
-                while let Some(item) = rx.recv().await {
-                    let permit = match w_semaphore.clone().acquire_owned().await {
+                loop {
+                    let item = tokio::select! {
+                        item = rx.recv() => {
+                            match item {
+                                Some(i) => i,
+                                None => break,
+                            }
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                            if cancelled_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+
+                    if cancelled_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+
+                    let permit = match semaphore.clone().acquire_owned().await {
                         Ok(p) => p,
                         Err(_) => break,
                     };
-                    let c = w_client.clone();
-                    let cf = w_cfg.clone();
-                    let em = w_emitter.clone();
-                    let tx = w_done_tx.clone();
+
+                    if cancelled_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+
+                    let c = client.clone();
+                    let cf = cfg_worker.clone();
+                    let em = emitter_worker.clone();
+                    let tx = done_tx.clone();
 
                     tokio::spawn(async move {
                         let _permit = permit;
@@ -193,54 +252,70 @@ impl Crawler {
                         let _ = tx.send(output).await;
                     });
                 }
-            });
+            })
+        };
 
-            let inject_tx = work_tx.clone();
-            let i_visited = visited.clone();
-            let i_pages_count = pages_count.clone();
-            let i_max_pages = cfg.max_pages;
-            let i_max_depth = cfg.max_depth;
-            let i_domain = domain.clone();
-            let i_scheme = scheme.clone();
-            let i_emitter = emitter.clone();
-            let i_paused = paused.clone();
+        let inject_tx = work_tx.clone();
+        let i_visited = visited.clone();
+        let i_pages_count = pages_count.clone();
+        let i_max_pages = config.max_pages;
+        let i_max_depth = config.max_depth;
+        let i_domain = domain.clone();
+        let i_scheme = scheme.clone();
+        let i_emitter = emitter.clone();
+        let i_paused = control_paused.clone();
+        let i_cancelled = cancelled_flag.clone();
 
-            let collector = tokio::spawn(async move {
-                while let Some(output) = done_rx.recv().await {
-                    let archived = output.page.clone();
+        let collector = tokio::spawn(async move {
+            while let Some(output) = done_rx.recv().await {
+                let archived = output.page.clone();
 
-                    if *i_paused.load(std::sync::atomic::Ordering::SeqCst) {
-                        let _ = result_tx.send(archived).await;
-                        continue;
-                    }
+                let _ = result_tx.send(archived.clone()).await;
 
-                    for link in &output.found_links {
-                        if let Ok(parsed) = Url::parse(link) {
-                            if parsed.domain().map(|d| d == i_domain) != Some(true) {
+                if i_cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
+
+                if i_paused.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
+
+                for link in &output.found_links {
+                    if let Ok(parsed) = Url::parse(link) {
+                        if parsed.domain().map(|d| d == i_domain) != Some(true) {
+                            continue;
+                        }
+                        if parsed.scheme() != i_scheme {
+                            continue;
+                        }
+
+                        let mut fragless_url = parsed.clone();
+                        fragless_url.set_fragment(None);
+                        let fragless = fragless_url.to_string();
+                        let key = normalize_url(&fragless);
+
+                        let depth = archived.depth + 1;
+                        if depth > i_max_depth {
+                            continue;
+                        }
+
+                        let should_inject = {
+                            if i_visited.contains(&key) {
                                 continue;
                             }
-                            if parsed.scheme() != i_scheme {
+                            let current = i_pages_count.load(std::sync::atomic::Ordering::SeqCst);
+                            if current >= i_max_pages {
                                 continue;
                             }
-                            let fragless = parsed.clone().fragment(None).to_string();
-                            let key = normalize_url(&fragless);
-                            {
-                                let mut v = i_visited.lock().await;
-                                if v.contains(&key) {
-                                    continue;
-                                }
-                                let current = i_pages_count.load(std::sync::atomic::Ordering::SeqCst);
-                                if current >= i_max_pages {
-                                    continue;
-                                }
-                                v.insert(key);
+                            let inserted = !i_visited.contains(&key);
+                            if inserted {
+                                i_visited.insert(key);
                             }
+                            inserted
+                        };
+
+                        if should_inject {
                             i_pages_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-                            let depth = archived.depth + 1;
-                            if depth > i_max_depth {
-                                continue;
-                            }
 
                             let _ = i_emitter.emit("crawl-discover", &serde_json::json!({
                                 "url": link,
@@ -255,75 +330,87 @@ impl Crawler {
                             }).await;
                         }
                     }
-
-                    let _ = result_tx.send(archived).await;
                 }
-            });
-
-            (worker_loop, collector)
+            }
         });
 
         let mut results: Vec<ArchivedPage> = Vec::new();
-        let emitter_e = emitter.clone();
-        let mut cancel = self.cancel_rx.clone();
-        let mut pause = self.pause_rx.clone();
-        let p_flag = self.paused.clone();
+        let emitter_result = emitter.clone();
+        let mut cancel_rx = control.cancel_rx();
+        let mut pause_rx = control.pause_rx();
 
         loop {
             tokio::select! {
                 page = result_rx.recv() => {
                     match page {
                         Some(p) => {
-                            let _ = emitter_e.emit("archive-success", &serde_json::to_value(&p).unwrap_or_default()).await;
+                            let _ = emitter_result.emit("archive-success", &serde_json::to_value(&p).unwrap_or_default()).await;
                             results.push(p);
                         }
                         None => break,
                     }
                 }
-                _ = cancel.changed() => {
-                    if *cancel.borrow() {
+                _ = cancel_rx.changed() => {
+                    if *cancel_rx.borrow() {
+                        cancelled_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                         break;
                     }
                 }
-                _ = pause.changed() => {
-                    if *pause.borrow() {
+                _ = pause_rx.changed() => {
+                    if *pause_rx.borrow() {
                         loop {
                             tokio::select! {
-                                res = result_rx.recv() => {
-                                    if res.is_none() {
+                                page = result_rx.recv() => {
+                                    match page {
+                                        Some(p) => {
+                                            let _ = emitter_result.emit("archive-success", &serde_json::to_value(&p).unwrap_or_default()).await;
+                                            results.push(p);
+                                        }
+                                        None => break,
+                                    }
+                                }
+                                _ = cancel_rx.changed() => {
+                                    if *cancel_rx.borrow() {
+                                        cancelled_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                                         break;
                                     }
                                 }
-                                _ = cancel.changed() => {
-                                    if *cancel.borrow() {
-                                        break;
-                                    }
-                                }
-                                _ = pause.changed() => {
-                                    if !*p_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                                _ = pause_rx.changed() => {
+                                    if !control_paused.load(std::sync::atomic::Ordering::SeqCst) {
                                         break;
                                     }
                                 }
                                 _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
-                                    if !*p_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                                    if !control_paused.load(std::sync::atomic::Ordering::SeqCst) {
                                         break;
                                     }
                                 }
                             }
+                        }
+                        if cancelled_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
                         }
                     }
                 }
             }
         }
 
-        worker_handle.abort();
-        Ok(results)
-    }
+        cancelled_flag.store(true, std::sync::atomic::Ordering::SeqCst);
 
-    async fn reset_state(&self) {
-        self.visited.lock().await.clear();
-        self.pages_count.store(0, std::sync::atomic::Ordering::SeqCst);
-        self.paused.store(false, std::sync::atomic::Ordering::SeqCst);
+        drop(work_tx);
+
+        worker_loop.abort();
+        collector.abort();
+
+        let _ = worker_loop.await;
+        let _ = collector.await;
+
+        let _ = emitter.emit("crawl-done", &serde_json::json!({
+            "pages_archived": results.len(),
+            "cancelled": cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        })).await;
+
+        Ok(results)
     }
 }
 
@@ -354,25 +441,27 @@ async fn process_page(
         "depth": depth,
     })).await;
 
-    let response = match client.get(&url_str).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            page.status = PageStatus::Failed(e.to_string());
+    let html_text = {
+        let response = match client.get(&url_str).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                page.status = PageStatus::Failed(e.to_string());
+                return WorkerOutput { page, found_links: vec![] };
+            }
+        };
+
+        let status_code = response.status();
+        if !status_code.is_success() {
+            page.status = PageStatus::Failed(format!("HTTP {}", status_code));
             return WorkerOutput { page, found_links: vec![] };
         }
-    };
 
-    let status_code = response.status();
-    if !status_code.is_success() {
-        page.status = PageStatus::Failed(format!("HTTP {}", status_code));
-        return WorkerOutput { page, found_links: vec![] };
-    }
-
-    let html_text = match response.text().await {
-        Ok(t) => t,
-        Err(e) => {
-            page.status = PageStatus::Failed(e.to_string());
-            return WorkerOutput { page, found_links: vec![] };
+        match response.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                page.status = PageStatus::Failed(e.to_string());
+                return WorkerOutput { page, found_links: vec![] };
+            }
         }
     };
 
@@ -384,14 +473,21 @@ async fn process_page(
         "depth": depth,
     })).await;
 
-    let document = Html::parse_document(&html_text);
+    let (title, links, extracted) = {
+        let document = Html::parse_document(&html_text);
 
-    page.title = extract_title(&document);
-    if page.title.is_empty() {
+        let title = extract_title(&document);
+        let links = extract_links(&document, &url_str);
+        let extracted = extract_and_sanitize(&document, &config.css_selectors, config.preserve_html);
+
+        (title, links, extracted)
+    };
+
+    if title.is_empty() {
         page.title = url_str.clone();
+    } else {
+        page.title = title;
     }
-
-    let links = extract_links(&document, &url_str);
     page.discovered_links = links.len() as u32;
 
     let _ = emitter.emit("crawl-discover", &serde_json::json!({
@@ -399,8 +495,6 @@ async fn process_page(
         "depth": depth,
         "link_count": links.len(),
     })).await;
-
-    let extracted = extract_and_sanitize(&document, &config.css_selectors, config.preserve_html);
 
     page.status = PageStatus::Archiving;
 
@@ -511,13 +605,8 @@ static STRIP_TAGS: &[&str] = &[
     "svg", "canvas",
 ];
 
-static STRUCTURAL_TAGS: &[&str] = &[
-    "div", "p", "h1", "h2", "h3", "h4", "h5", "h6",
-    "ul", "ol", "li", "table", "thead", "tbody", "tr", "th", "td",
-    "a", "img", "figure", "figcaption", "blockquote", "pre", "code",
-    "span", "strong", "em", "b", "i", "u", "br", "hr",
-    "section", "article", "main", "header", "footer", "nav", "aside",
-    "dl", "dt", "dd", "abbr", "cite", "time", "mark", "summary", "details",
+static VOID_TAGS: &[&str] = &[
+    "br", "hr", "img", "input", "meta", "link",
 ];
 
 static TRACKING_ATTRS: &[&str] = &[
@@ -529,7 +618,7 @@ static TRACKING_ATTRS: &[&str] = &[
 
 struct TagSets {
     strip: HashSet<&'static str>,
-    structural: HashSet<&'static str>,
+    void_tags: HashSet<&'static str>,
     tracking: HashSet<&'static str>,
 }
 
@@ -537,22 +626,22 @@ impl TagSets {
     fn new() -> Self {
         Self {
             strip: STRIP_TAGS.iter().copied().collect(),
-            structural: STRUCTURAL_TAGS.iter().copied().collect(),
+            void_tags: VOID_TAGS.iter().copied().collect(),
             tracking: TRACKING_ATTRS.iter().copied().collect(),
         }
     }
-}
 
-fn is_strip_tag(tag: &str, sets: &TagSets) -> bool {
-    sets.strip.contains(tag)
-}
+    fn is_strip(&self, tag: &str) -> bool {
+        self.strip.contains(tag)
+    }
 
-fn is_structural(tag: &str, sets: &TagSets) -> bool {
-    sets.structural.contains(tag)
-}
+    fn is_void(&self, tag: &str) -> bool {
+        self.void_tags.contains(tag)
+    }
 
-fn is_tracking_attr(attr: &str, sets: &TagSets) -> bool {
-    sets.tracking.contains(attr) || attr.starts_with("on")
+    fn is_tracking_attr(&self, attr: &str) -> bool {
+        self.tracking.contains(attr) || attr.starts_with("on")
+    }
 }
 
 fn sanitize_to_html(elements: &[scraper::ElementRef]) -> String {
@@ -560,41 +649,40 @@ fn sanitize_to_html(elements: &[scraper::ElementRef]) -> String {
     let mut output = String::new();
 
     for el in elements {
-        let node_id = el.id();
-        for child in el.children() {
-            output.push_str(&render_node_html(child, &sets));
+        for child_node_ref in el.children() {
+            output.push_str(&render_node_html(&child_node_ref, &sets));
         }
     }
 
     output
 }
 
-fn render_node_html(node: scraper::Node, sets: &TagSets) -> String {
-    match node.value() {
-        scraper::Node::Text(t) => html_escape(&t.text),
-        scraper::Node::Element(el) => {
+fn render_node_html(node_ref: &NodeRef<Node>, sets: &TagSets) -> String {
+    match node_ref.value() {
+        Node::Text(t) => html_escape(&t.text),
+        Node::Element(el) => {
             let tag = el.name.local.as_ref();
 
-            if is_strip_tag(tag, sets) {
+            if sets.is_strip(tag) {
                 return String::new();
             }
 
             let attrs: String = el
                 .attrs
                 .iter()
-                .filter(|(k, _)| !is_tracking_attr(k.local.as_ref(), sets) && k.local.as_ref() != "style")
+                .filter(|(k, _)| !sets.is_tracking_attr(k.local.as_ref()) && k.local.as_ref() != "style")
                 .map(|(k, v)| format!(" {}=\"{}\"", k.local, html_escape(v)))
                 .collect();
 
-            let inner: String = node.children().map(|c| render_node_html(c, sets)).collect();
-
-            if is_structural(tag, sets) {
-                format!("<{}{}>{}</{}>", tag, attrs, inner, tag)
-            } else {
-                format!("<{}{}>{}</{}>", tag, attrs, inner, tag)
+            if sets.is_void(tag) {
+                return format!("<{}{} />", tag, attrs);
             }
+
+            let inner: String = node_ref.children().map(|c| render_node_html(&c, sets)).collect();
+
+            format!("<{}{}>{}</{}>", tag, attrs, inner, tag)
         }
-        scraper::Node::Comment(_) => String::new(),
+        Node::Comment(_) => String::new(),
         _ => String::new(),
     }
 }
@@ -604,7 +692,7 @@ fn sanitize_to_text(elements: &[scraper::ElementRef]) -> String {
     let mut output = Vec::new();
 
     for el in elements {
-        let text = collect_text(el, &sets);
+        let text = collect_text_from_element(el, &sets);
         if !text.trim().is_empty() {
             output.push(text.trim().to_string());
         }
@@ -613,28 +701,26 @@ fn sanitize_to_text(elements: &[scraper::ElementRef]) -> String {
     output.join("\n\n")
 }
 
-fn collect_text(node: scraper::ElementRef, sets: &TagSets) -> String {
+fn collect_text_from_element(el: &scraper::ElementRef, sets: &TagSets) -> String {
     let mut result = String::new();
-
-    for child in node.children() {
-        result.push_str(&collect_text_recursive(child, sets));
+    for child_node_ref in el.children() {
+        result.push_str(&collect_text_recursive(&child_node_ref, sets));
     }
-
     result
 }
 
-fn collect_text_recursive(node: scraper::Node, sets: &TagSets) -> String {
-    match node.value() {
-        scraper::Node::Text(t) => t.text.clone(),
-        scraper::Node::Element(el) => {
+fn collect_text_recursive(node_ref: &NodeRef<Node>, sets: &TagSets) -> String {
+    match node_ref.value() {
+        Node::Text(t) => t.text.to_string(),
+        Node::Element(el) => {
             let tag = el.name.local.as_ref();
-            if is_strip_tag(tag, sets) {
+            if sets.is_strip(tag) {
                 return String::new();
             }
 
-            let inner: String = node
+            let inner: String = node_ref
                 .children()
-                .map(|c| collect_text_recursive(c, sets))
+                .map(|c| collect_text_recursive(&c, sets))
                 .collect();
 
             let is_block = matches!(
@@ -655,7 +741,7 @@ fn collect_text_recursive(node: scraper::Node, sets: &TagSets) -> String {
                 inner
             }
         }
-        scraper::Node::Comment(_) => String::new(),
+        Node::Comment(_) => String::new(),
         _ => String::new(),
     }
 }
@@ -664,7 +750,7 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&")
         .replace('<', "<")
         .replace('>', ">")
-        .replace('"', """)
+        .replace('"', "&#34;")
 }
 
 fn compute_hash(content: &str, algorithm: &HashAlgorithm) -> String {

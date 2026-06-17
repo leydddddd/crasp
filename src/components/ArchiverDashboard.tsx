@@ -8,7 +8,6 @@ import {
   Globe,
   CheckCircle2,
   XCircle,
-  Search,
   Database,
   Hash,
   Layers,
@@ -17,7 +16,7 @@ import {
   Activity,
 } from "lucide-react";
 import { useArchiver } from "@/hooks/useArchiver";
-import type { ArchivedPage, PageStatus, ArchiveStatus, CrawlConfig } from "@/types/archiver";
+import type { ArchivedPage, PageStatus, ArchiveStatus } from "@/types/archiver";
 
 export function ArchiverDashboard() {
   const archiver = useArchiver();
@@ -53,9 +52,8 @@ export function ArchiverDashboard() {
   });
 
   const handleStart = useCallback(() => {
-    if (!archiver.config.seed_url.trim()) return;
     archiver.startCrawl();
-  }, [archiver]);
+  }, [archiver.startCrawl]);
 
   return (
     <div className="flex h-screen w-screen flex-col bg-gray-950 text-gray-100 overflow-hidden">
@@ -78,13 +76,13 @@ export function ArchiverDashboard() {
           </div>
         </div>
         <div className="flex items-center gap-2">
-          {archiver.status === "idle" && (
+          {archiver.status !== "crawling" && archiver.status !== "paused" && (
             <button
               onClick={() => setConfigOpen(!configOpen)}
               className="flex items-center gap-1.5 rounded-md bg-gray-800 px-3 py-1.5 text-xs font-medium text-gray-300 hover:bg-gray-700 transition-colors"
             >
               <Settings2 className="h-3.5 w-3.5" />
-              Config
+              {configOpen ? "Hide Config" : "Config"}
             </button>
           )}
           {archiver.status === "crawling" && (
@@ -242,14 +240,14 @@ export function ArchiverDashboard() {
                   }
                   disabled={archiver.status !== "idle"}
                   className={`relative h-4 w-8 rounded-full transition-colors disabled:opacity-50 ${
-                    archiver.config.preserve_html ? "bg-vault-600" : "bg-gray-700"
+                    archiver.config.preserve_html
+                      ? "bg-vault-600"
+                      : "bg-gray-700"
                   }`}
                 >
                   <span
                     className={`absolute top-0.5 h-3 w-3 rounded-full bg-white transition-transform ${
-                      archiver.config.preserve_html
-                        ? "left-[18px]"
-                        : "left-0.5"
+                      archiver.config.preserve_html ? "left-[18px]" : "left-0.5"
                     }`}
                   />
                 </button>
@@ -308,8 +306,11 @@ export function ArchiverDashboard() {
                 <div className="mb-1 flex items-center justify-between text-[11px] text-gray-500">
                   <span>Progress</span>
                   <span>
-                    {Math.min(archiver.stats.completed, archiver.config.max_pages)} /{" "}
-                    {archiver.config.max_pages}
+                    {Math.min(
+                      archiver.stats.completed,
+                      archiver.config.max_pages,
+                    )}{" "}
+                    / {archiver.config.max_pages}
                   </span>
                 </div>
                 <div className="h-1.5 overflow-hidden rounded-full bg-gray-800">
@@ -318,7 +319,8 @@ export function ArchiverDashboard() {
                     style={{
                       width: `${Math.min(
                         100,
-                        (archiver.stats.completed / archiver.config.max_pages) * 100
+                        (archiver.stats.completed / archiver.config.max_pages) *
+                          100,
                       )}%`,
                     }}
                   />
@@ -357,8 +359,8 @@ export function ArchiverDashboard() {
                       p.status === "fetching"
                         ? "text-blue-400"
                         : p.status === "scraping"
-                        ? "text-amber-400"
-                        : "text-vault-400"
+                          ? "text-amber-400"
+                          : "text-vault-400"
                     }`}
                   >
                     {p.status}
@@ -407,7 +409,7 @@ export function ArchiverDashboard() {
                       className="flex items-center gap-3 border-b border-gray-800/50 px-4 hover:bg-gray-900/50 cursor-pointer transition-colors"
                       onClick={() =>
                         setSelectedPage(
-                          selectedPage?.url === page.url ? null : page
+                          selectedPage?.url === page.url ? null : page,
                         )
                       }
                     >
@@ -457,10 +459,18 @@ function PageStatusIcon({ status }: { status: PageStatus }) {
     return <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-500" />;
   }
   if (status === "Pending") {
-    return <div className="h-4 w-4 shrink-0 rounded-full border-2 border-gray-700" />;
+    return (
+      <div className="h-4 w-4 shrink-0 rounded-full border-2 border-gray-700" />
+    );
   }
-  if (status === "Fetching" || status === "Scraping" || status === "Archiving") {
-    return <div className="h-4 w-4 shrink-0 rounded-full border-2 border-vault-400 animate-pulse" />;
+  if (
+    status === "Fetching" ||
+    status === "Scraping" ||
+    status === "Archiving"
+  ) {
+    return (
+      <div className="h-4 w-4 shrink-0 rounded-full border-2 border-vault-400 animate-pulse" />
+    );
   }
   if (typeof status === "object" && "Failed" in status) {
     return <XCircle className="h-4 w-4 shrink-0 text-red-500" />;

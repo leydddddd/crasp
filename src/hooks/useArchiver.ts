@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import type {
@@ -7,8 +7,8 @@ import type {
   CrawlConfig,
   CrawlDiscoverPayload,
   ScrapeProgressPayload,
-  ArchiveSuccessPayload,
   CrawlStats,
+  CrawlDonePayload,
   PageStatus,
 } from "@/types/archiver";
 
@@ -24,9 +24,9 @@ export function useArchiver() {
     skipped: 0,
     discovered: 0,
   });
-  const [progress, setProgress] = useState<Map<string, ScrapeProgressPayload>>(
-    new Map()
-  );
+  const [progressMap, setProgressMap] = useState<
+    Map<string, ScrapeProgressPayload>
+  >(new Map());
   const [error, setError] = useState<string | null>(null);
   const [config, setConfig] = useState<CrawlConfig>({
     seed_url: "",
@@ -38,22 +38,29 @@ export function useArchiver() {
     hash_algorithm: "sha256",
   });
 
-  const unlisteners = useRef<Array<() => void>>([]);
   const pageMap = useRef<Map<string, ArchivedPage>>(new Map());
   const discoveredSet = useRef<Set<string>>(new Set());
 
   useEffect(() => {
+    const unlisteners: Array<() => void> = [];
+    let cancelled = false;
+
     const setup = async () => {
       const u1 = await listen<ScrapeProgressPayload>(
         "scrape-progress",
         (event) => {
-          setProgress((prev) => {
+          setProgressMap((prev) => {
             const next = new Map(prev);
             next.set(event.payload.url, event.payload);
             return next;
           });
         }
       );
+      if (cancelled) {
+        u1();
+        return;
+      }
+      unlisteners.push(u1);
 
       const u2 = await listen<CrawlDiscoverPayload>(
         "crawl-discover",
@@ -68,11 +75,16 @@ export function useArchiver() {
           }
         }
       );
+      if (cancelled) {
+        u2();
+        return;
+      }
+      unlisteners.push(u2);
 
-      const u3 = await listen<ArchiveSuccessPayload>(
+      const u3 = await listen<ArchivedPage>(
         "archive-success",
         (event) => {
-          const page = event.payload as unknown as ArchivedPage;
+          const page = event.payload;
           pageMap.current.set(page.url, page);
           setPages(
             Array.from(pageMap.current.values()).slice(-MAX_QUEUE_DISPLAY)
@@ -84,48 +96,67 @@ export function useArchiver() {
             else if (isSkipped(page.status)) next.skipped++;
             return next;
           });
-          setProgress((prev) => {
+          setProgressMap((prev) => {
             const next = new Map(prev);
             next.delete(page.url);
             return next;
           });
         }
       );
+      if (cancelled) {
+        u3();
+        return;
+      }
+      unlisteners.push(u3);
 
-      unlisteners.current = [u1, u2, u3];
+      const u4 = await listen<CrawlDonePayload>("crawl-done", (event) => {
+        setStatus((prev) => {
+          if (prev === "crawling" || prev === "paused") {
+            return event.payload.cancelled ? "idle" : "completed";
+          }
+          return prev;
+        });
+      });
+      if (cancelled) {
+        u4();
+        return;
+      }
+      unlisteners.push(u4);
     };
 
     setup();
 
     return () => {
-      unlisteners.current.forEach((fn) => fn());
+      cancelled = true;
+      unlisteners.forEach((fn) => fn());
     };
   }, []);
 
-  const startCrawl = useCallback(async () => {
-    if (status === "crawling" || status === "paused") return;
+  const progress = useMemo(
+    () => Array.from(progressMap.values()),
+    [progressMap]
+  );
 
+  const startCrawl = useCallback(async () => {
     pageMap.current.clear();
     discoveredSet.current.clear();
     setPages([]);
     setStats({ total: 0, completed: 0, failed: 0, skipped: 0, discovered: 0 });
-    setProgress(new Map());
+    setProgressMap(new Map());
     setError(null);
     setStatus("crawling");
 
     try {
       await invoke("start_crawl", { config });
-      setStatus("completed");
     } catch (e) {
       setError(String(e));
       setStatus("error");
     }
-  }, [config, status]);
+  }, [config]);
 
   const cancelCrawl = useCallback(async () => {
     try {
       await invoke("cancel_crawl");
-      setStatus("idle");
     } catch (e) {
       setError(String(e));
     }
@@ -154,7 +185,7 @@ export function useArchiver() {
     discoveredSet.current.clear();
     setPages([]);
     setStats({ total: 0, completed: 0, failed: 0, skipped: 0, discovered: 0 });
-    setProgress(new Map());
+    setProgressMap(new Map());
     setError(null);
     setStatus("idle");
   }, []);
@@ -163,7 +194,7 @@ export function useArchiver() {
     status,
     pages,
     stats,
-    progress: Array.from(progress.values()),
+    progress,
     error,
     config,
     setConfig,

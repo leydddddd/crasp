@@ -1,13 +1,13 @@
 mod commands;
 mod crawler;
 
-use commands::CrawlerHandle;
+use commands::CrawlState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(CrawlerHandle::new())
+        .manage(CrawlState::new())
         .invoke_handler(tauri::generate_handler![
             commands::start_crawl,
             commands::cancel_crawl,

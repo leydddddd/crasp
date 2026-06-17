@@ -62,3 +62,8 @@ export interface CrawlStats {
   skipped: number;
   discovered: number;
 }
+
+export interface CrawlDonePayload {
+  pages_archived: number;
+  cancelled: boolean;
+}

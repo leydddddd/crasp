@@ -1,9 +1,8 @@
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tauri::AppHandle;
 use tauri::Emitter;
 
-use crate::crawler::{ArchivedPage, CrawlConfig, Crawler, HashAlgorithm};
+use crate::crawler::{CrawlConfig, Crawler, CrawlControl};
 
 #[derive(Clone)]
 pub struct TauriEmitter {
@@ -22,14 +21,16 @@ impl TauriEmitter {
     }
 }
 
-pub struct CrawlerHandle {
-    crawler: Arc<Mutex<Option<Crawler>>>,
+pub struct CrawlState {
+    control: std::sync::Mutex<Arc<CrawlControl>>,
+    task_handle: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
 }
 
-impl CrawlerHandle {
+impl CrawlState {
     pub fn new() -> Self {
         Self {
-            crawler: Arc::new(Mutex::new(None)),
+            control: std::sync::Mutex::new(Arc::new(CrawlControl::new())),
+            task_handle: std::sync::Mutex::new(None),
         }
     }
 }
@@ -38,68 +39,56 @@ impl CrawlerHandle {
 pub async fn start_crawl(
     app: AppHandle,
     config: CrawlConfig,
-    state: tauri::State<'_, CrawlerHandle>,
-) -> Result<Vec<ArchivedPage>, String> {
-    let crawler = Crawler::new();
+    state: tauri::State<'_, CrawlState>,
+) -> Result<(), String> {
+    {
+        let mut handle = state.task_handle.lock().unwrap();
+        if let Some(h) = handle.take() {
+            h.abort();
+        }
+    }
+
+    let new_control = Arc::new(CrawlControl::new());
+    {
+        let mut ctrl = state.control.lock().unwrap();
+        *ctrl = new_control.clone();
+    }
+
     let emitter = TauriEmitter::new(app);
+    let control = new_control;
+
+    let handle = tokio::spawn(async move {
+        let crawler = Crawler::new();
+        let _ = crawler.run(config, emitter, &control).await;
+    });
 
     {
-        let mut guard = state.crawler.lock().await;
-        *guard = Some(crawler);
+        let mut h = state.task_handle.lock().unwrap();
+        *h = Some(handle.abort_handle());
     }
 
-    let crawler_clone = state.crawler.clone();
-    let result = {
-        let guard = crawler_clone.lock().await;
-        match guard.as_ref() {
-            Some(c) => c.run(config, emitter).await,
-            None => Err("no crawler instance".to_string()),
-        }
-    };
-
-    let mut guard = state.crawler.lock().await;
-    *guard = None;
-
-    result
+    Ok(())
 }
 
 #[tauri::command]
-pub async fn cancel_crawl(
-    state: tauri::State<'_, CrawlerHandle>,
-) -> Result<(), String> {
-    let guard = state.crawler.lock().await;
-    if let Some(crawler) = guard.as_ref() {
-        crawler.cancel();
-        Ok(())
-    } else {
-        Err("no active crawl".to_string())
-    }
+pub fn cancel_crawl(state: tauri::State<'_, CrawlState>) -> Result<(), String> {
+    let ctrl = state.control.lock().unwrap();
+    ctrl.cancel();
+    Ok(())
 }
 
 #[tauri::command]
-pub async fn pause_crawl(
-    state: tauri::State<'_, CrawlerHandle>,
-) -> Result<(), String> {
-    let guard = state.crawler.lock().await;
-    if let Some(crawler) = guard.as_ref() {
-        crawler.pause();
-        Ok(())
-    } else {
-        Err("no active crawl".to_string())
-    }
+pub fn pause_crawl(state: tauri::State<'_, CrawlState>) -> Result<(), String> {
+    let ctrl = state.control.lock().unwrap();
+    ctrl.pause();
+    Ok(())
 }
 
 #[tauri::command]
-pub async fn resume_crawl(
-    state: tauri::State<'_, CrawlerHandle>,
-) -> Result<(), String> {
-    let guard = state.crawler.lock().await;
-    if let Some(crawler) = guard.as_ref() {
-        crawler.resume();
-        Ok(())
-    } else {
-        Err("no active crawl".to_string())
-    }
+pub fn resume_crawl(state: tauri::State<'_, CrawlState>) -> Result<(), String> {
+    let ctrl = state.control.lock().unwrap();
+    ctrl.resume();
+    Ok(())
 }
 
 #[tauri::command]
