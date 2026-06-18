@@ -3,11 +3,19 @@ use mongodb::IndexModel;
 
 use crate::schema::{CrawlDoc, HashDoc, PageDoc};
 
+#[derive(Clone, serde::Serialize)]
+pub struct AppStatus {
+    pub mongo_ok: bool,
+    pub zyte_available: bool,
+    pub zyte_project: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct ArchiveStore {
     database: mongodb::Database,
 }
 
+#[allow(dead_code)]
 impl ArchiveStore {
     pub async fn from_uri(uri: &str) -> Result<Self, String> {
         let client = mongodb::Client::with_uri_str(uri)
@@ -111,6 +119,144 @@ pub async fn persist_batch(
             .insert_many(docs)
             .await
             .map_err(|e| format!("Batch insert failed: {}", e))?;
+    }
+
+    Ok(())
+}
+
+pub async fn upsert_hash(store: &ArchiveStore, hash_doc: HashDoc) -> Result<(), String> {
+    use mongodb::bson::to_document;
+
+    let doc = to_document(&hash_doc).map_err(|e| format!("BSON encode failed: {}", e))?;
+
+    let filter = doc! {
+        "hash": &hash_doc.hash,
+        "hash_algorithm": &hash_doc.hash_algorithm,
+    };
+
+    let update = doc! {
+        "$setOnInsert": doc,
+        "$inc": { "occurrences": 1 },
+    };
+
+    let options = mongodb::options::UpdateOptions::builder()
+        .upsert(true)
+        .build();
+
+    store
+        .hashes_col()
+        .update_one(filter, update)
+        .with_options(options)
+        .await
+        .map_err(|e| format!("Hash upsert failed: {}", e))?;
+
+    Ok(())
+}
+
+pub async fn persist_items(
+    store: &ArchiveStore,
+    items: Vec<serde_json::Value>,
+    crawl_id: &str,
+) -> Result<(), String> {
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let mut pages = Vec::with_capacity(items.len());
+    let mut hashes = Vec::new();
+
+    for item in &items {
+        let url = item
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let title = item
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let depth = item
+            .get("depth")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let status = item
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Completed")
+            .to_string();
+        let content = item
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let content_format = if content.starts_with('<') {
+            "html"
+        } else {
+            "text"
+        };
+        let hash_val = item.get("hash").and_then(|v| v.as_str()).map(String::from);
+        let hash_algorithm = item
+            .get("hash_algorithm")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let discovered_links = item
+            .get("discovered_links")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let timestamp = item
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let url_normalized = url.to_lowercase();
+        let search_blob = format!("{} {}", title, url);
+
+        let page = PageDoc {
+            crawl_id: crawl_id.to_string(),
+            url: url.clone(),
+            url_normalized,
+            depth,
+            title,
+            status,
+            status_code: 200,
+            content,
+            content_format: content_format.to_string(),
+            content_bytes: None,
+            discovered_links,
+            timestamp: if timestamp.is_empty() {
+                chrono::Utc::now().to_rfc3339()
+            } else {
+                timestamp
+            },
+            duplicate_group_id: 0,
+            search_blob,
+        };
+        pages.push(page);
+
+        if let (Some(hash), Some(algo)) = (&hash_val, &hash_algorithm) {
+            hashes.push(HashDoc {
+                hash: hash.clone(),
+                hash_algorithm: algo.clone(),
+                first_seen_crawl_id: crawl_id.to_string(),
+                first_seen_url: url.clone(),
+                first_seen_at: chrono::Utc::now().to_rfc3339(),
+                occurrences: 1,
+            });
+        }
+    }
+
+    if !pages.is_empty() {
+        if let Err(e) = persist_batch(store, pages).await {
+            eprintln!("Warning: persist_batch failed: {}", e);
+        }
+    }
+
+    for hash_doc in hashes {
+        if let Err(e) = upsert_hash(store, hash_doc).await {
+            eprintln!("Warning: upsert_hash failed: {}", e);
+        }
     }
 
     Ok(())

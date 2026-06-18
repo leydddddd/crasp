@@ -14,9 +14,17 @@ import {
   ArrowDownToLine,
   Settings2,
   Activity,
+  Cloud,
+  Terminal,
 } from "lucide-react";
 import { useArchiver } from "@/hooks/useArchiver";
-import type { ArchivedPage, PageStatus, ArchiveStatus } from "@/types/archiver";
+import type { ArchivedPage, PageStatus, ArchiveStatus, Engine } from "@/types/archiver";
+
+const ENGINE_OPTIONS: { value: Engine; label: string; icon: React.ReactNode }[] = [
+  { value: "local", label: "Local", icon: <Database className="h-3 w-3" /> },
+  { value: "cloud", label: "Cloud", icon: <Cloud className="h-3 w-3" /> },
+  { value: "local-scrapy", label: "Local Scrapy", icon: <Terminal className="h-3 w-3" /> },
+];
 
 export function ArchiverDashboard() {
   const archiver = useArchiver();
@@ -54,6 +62,8 @@ export function ArchiverDashboard() {
   const handleStart = useCallback(() => {
     archiver.startCrawl();
   }, [archiver.startCrawl]);
+
+  const isIdle = archiver.status === "idle";
 
   return (
     <div className="flex h-screen w-screen flex-col bg-gray-950 text-gray-100 overflow-hidden">
@@ -147,6 +157,68 @@ export function ArchiverDashboard() {
               Crawl Configuration
             </h2>
             <div className="space-y-3">
+              {/* Engine selector */}
+              <div>
+                <label className="mb-1.5 block text-[11px] text-gray-500">Engine</label>
+                <div className="flex rounded-md border border-gray-700 overflow-hidden">
+                  {ENGINE_OPTIONS.map((opt) => (
+                    <button
+                      key={opt.value}
+                      onClick={() => archiver.setEngine(opt.value)}
+                      disabled={!isIdle}
+                      className={`flex flex-1 items-center justify-center gap-1 px-2 py-1.5 text-[11px] font-medium transition-colors disabled:opacity-50 ${
+                        archiver.engine === opt.value
+                          ? "bg-crasp-600 text-white"
+                          : "bg-gray-800 text-gray-400 hover:bg-gray-700"
+                      }`}
+                    >
+                      {opt.icon}
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Cloud engine config */}
+              {archiver.engine === "cloud" && (
+                <div className="rounded-md border border-gray-800 bg-gray-900/50 p-3 space-y-2.5">
+                  <div className="flex items-center gap-1.5 text-[11px]">
+                    <span
+                      className={`h-2 w-2 rounded-full ${
+                        archiver.appStatus?.zyte_available
+                          ? "bg-emerald-500"
+                          : "bg-red-500"
+                      }`}
+                    />
+                    <span className="text-gray-400">
+                      {archiver.appStatus?.zyte_available
+                        ? "Zyte connected"
+                        : "Zyte not configured"}
+                    </span>
+                  </div>
+                  <InputField
+                    label="Zyte API Key"
+                    value={archiver.zyteApiKey}
+                    onChange={archiver.setZyteApiKey}
+                    placeholder="Enter API key..."
+                    disabled={!isIdle}
+                  />
+                  <InputField
+                    label="Project ID"
+                    value={archiver.zyteProjectId}
+                    onChange={archiver.setZyteProjectId}
+                    placeholder="Enter project ID..."
+                    disabled={!isIdle}
+                  />
+                  {!archiver.appStatus?.zyte_available &&
+                    !archiver.zyteApiKey.trim() && (
+                      <p className="text-[10px] text-amber-500">
+                        Set ZYTE_API_KEY or enter a key to enable cloud engine
+                      </p>
+                    )}
+                </div>
+              )}
+
               <InputField
                 label="Seed URL"
                 value={archiver.config.seed_url}
@@ -154,7 +226,7 @@ export function ArchiverDashboard() {
                   archiver.setConfig((c) => ({ ...c, seed_url: v }))
                 }
                 placeholder="https://example.com"
-                disabled={archiver.status !== "idle"}
+                disabled={!isIdle}
               />
               <div className="grid grid-cols-2 gap-3">
                 <InputField
@@ -167,7 +239,7 @@ export function ArchiverDashboard() {
                     }))
                   }
                   type="number"
-                  disabled={archiver.status !== "idle"}
+                  disabled={!isIdle}
                 />
                 <InputField
                   label="Max Pages"
@@ -179,7 +251,7 @@ export function ArchiverDashboard() {
                     }))
                   }
                   type="number"
-                  disabled={archiver.status !== "idle"}
+                  disabled={!isIdle}
                 />
               </div>
               <div className="grid grid-cols-2 gap-3">
@@ -193,7 +265,7 @@ export function ArchiverDashboard() {
                     }))
                   }
                   type="number"
-                  disabled={archiver.status !== "idle"}
+                  disabled={!isIdle}
                 />
                 <div>
                   <label className="mb-1 block text-[11px] text-gray-500">
@@ -207,7 +279,7 @@ export function ArchiverDashboard() {
                         hash_algorithm: e.target.value as "md5" | "sha256",
                       }))
                     }
-                    disabled={archiver.status !== "idle"}
+                    disabled={!isIdle}
                     className="w-full rounded-md border border-gray-700 bg-gray-800 px-2.5 py-1.5 text-xs text-gray-200 focus:border-crasp-500 focus:outline-none disabled:opacity-50"
                   >
                     <option value="sha256">SHA-256</option>
@@ -228,7 +300,7 @@ export function ArchiverDashboard() {
                   }))
                 }
                 placeholder="article, main, body"
-                disabled={archiver.status !== "idle"}
+                disabled={!isIdle}
               />
               <div className="flex items-center gap-2">
                 <button
@@ -238,7 +310,7 @@ export function ArchiverDashboard() {
                       preserve_html: !c.preserve_html,
                     }))
                   }
-                  disabled={archiver.status !== "idle"}
+                  disabled={!isIdle}
                   className={`relative h-4 w-8 rounded-full transition-colors disabled:opacity-50 ${
                     archiver.config.preserve_html
                       ? "bg-crasp-600"
@@ -259,7 +331,7 @@ export function ArchiverDashboard() {
               </div>
             </div>
 
-            {archiver.status === "idle" && (
+            {isIdle && (
               <button
                 onClick={handleStart}
                 disabled={!archiver.config.seed_url.trim()}
@@ -269,6 +341,34 @@ export function ArchiverDashboard() {
                 Start Archiving
               </button>
             )}
+          </div>
+
+          {/* Services Status */}
+          <div className="border-b border-gray-800 px-4 py-3">
+            <h2 className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-gray-400">
+              <Activity className="h-3.5 w-3.5" />
+              Services
+            </h2>
+            <div className="flex items-center gap-4">
+              <div className="flex items-center gap-1.5 text-[11px]">
+                <span
+                  className={`h-2 w-2 rounded-full ${
+                    archiver.appStatus?.mongo_ok ? "bg-emerald-500" : "bg-red-500"
+                  }`}
+                />
+                <span className="text-gray-400">MongoDB</span>
+              </div>
+              <div className="flex items-center gap-1.5 text-[11px]">
+                <span
+                  className={`h-2 w-2 rounded-full ${
+                    archiver.appStatus?.zyte_available
+                      ? "bg-emerald-500"
+                      : "bg-red-500"
+                  }`}
+                />
+                <span className="text-gray-400">Zyte</span>
+              </div>
+            </div>
           </div>
 
           {/* Stats */}

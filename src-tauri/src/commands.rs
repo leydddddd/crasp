@@ -1,9 +1,10 @@
 use std::sync::Arc;
-use tauri::AppHandle;
-use tauri::Emitter;
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::crawler::{CrawlConfig, Crawler, CrawlControl};
-use crate::zyte::{ZyteClient, ZyteJobRequest, ZyeJobArguments, ZyteProgress};
+use crate::runtime::AppContext;
+use crate::store::{self, AppStatus};
+use crate::zyte::{ZyteClient, ZyteJobRequest, ZyteJobArguments, ZyteProgress};
 
 #[derive(Clone)]
 pub struct TauriEmitter {
@@ -36,11 +37,35 @@ impl CrawlState {
     }
 }
 
+pub async fn persist_items(ctx: &Arc<AppContext>, items: Vec<serde_json::Value>) {
+    if items.is_empty() {
+        return;
+    }
+    if let Some(store) = &ctx.store {
+        let crawl_id = format!("crawl_{}", chrono::Utc::now().timestamp_millis());
+        if let Err(e) = store::persist_items(store, items, &crawl_id).await {
+            eprintln!("persist_items error: {}", e);
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn get_app_status(
+    ctx: tauri::State<'_, Arc<AppContext>>,
+) -> Result<AppStatus, String> {
+    Ok(AppStatus {
+        mongo_ok: ctx.mongo_ok(),
+        zyte_available: ctx.zyte_available(),
+        zyte_project: ctx.zyte_project.clone(),
+    })
+}
+
 #[tauri::command]
 pub async fn start_crawl(
     app: AppHandle,
     config: CrawlConfig,
     state: tauri::State<'_, CrawlState>,
+    ctx: tauri::State<'_, Arc<AppContext>>,
 ) -> Result<(), String> {
     {
         let mut handle = state.task_handle.lock();
@@ -57,6 +82,10 @@ pub async fn start_crawl(
 
     let emitter = TauriEmitter::new(app);
     let control = new_control;
+
+    control.reset();
+
+    let _ = ctx.inner().clone();
 
     let handle = tokio::spawn(async move {
         let crawler = Crawler::new();
@@ -78,7 +107,27 @@ pub async fn start_cloud_crawl(
     api_key: String,
     project_id: String,
     state: tauri::State<'_, CrawlState>,
+    ctx: tauri::State<'_, Arc<AppContext>>,
 ) -> Result<(), String> {
+    if ctx.zyte.is_none() && api_key.is_empty() {
+        return Err("Zyte engine not configured: set ZYTE_API_KEY and CRASP_ZYTE_PROJECT".to_string());
+    }
+
+    let effective_api_key = if api_key.is_empty() {
+        ctx.zyte
+            .as_ref()
+            .map(|c| c.api_key().to_string())
+            .unwrap_or_default()
+    } else {
+        api_key
+    };
+
+    let effective_project_id = if project_id.is_empty() {
+        ctx.zyte_project.clone().unwrap_or_default()
+    } else {
+        project_id
+    };
+
     {
         let mut handle = state.task_handle.lock();
         if let Some(h) = handle.take() {
@@ -93,15 +142,16 @@ pub async fn start_cloud_crawl(
     }
 
     let emitter = TauriEmitter::new(app);
+    let ctx_arc = ctx.inner().clone();
 
     let handle = tokio::spawn(async move {
         let _control = new_control;
-        let client = ZyteClient::new(api_key);
+        let client = ZyteClient::new(effective_api_key);
 
         let job_req = ZyteJobRequest {
-            project: project_id,
+            project: effective_project_id,
             spider: "crasp_archive".to_string(),
-            add_arguments: ZyeJobArguments {
+            add_arguments: ZyteJobArguments {
                 seed_url: config.seed_url.clone(),
                 max_depth: config.max_depth,
                 max_pages: config.max_pages,
@@ -160,11 +210,13 @@ pub async fn start_cloud_crawl(
         });
 
         let emitter_items = emitter.clone();
+        let ctx_items = ctx_arc.clone();
         let items_emitter = tokio::spawn(async move {
             let mut count = 0u64;
             while let Some(item) = items_rx.recv().await {
                 count += 1;
                 let _ = emitter_items.emit("archive-success", &item).await;
+                persist_items(&ctx_items, vec![item]).await;
             }
             count
         });
@@ -193,33 +245,51 @@ pub async fn start_cloud_crawl(
 pub async fn local_scrapy_crawl(
     app: AppHandle,
     config: CrawlConfig,
+    state: tauri::State<'_, CrawlState>,
+    ctx: tauri::State<'_, Arc<AppContext>>,
 ) -> Result<(), String> {
-    let emitter = TauriEmitter::new(app);
-
-    let out_path = format!("crasp_{}.jl", chrono::Utc::now().timestamp());
-    let result = crate::local_scrapy::run_local_spider(&config, &out_path).await;
-
-    match result {
-        Ok(output) => {
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let _ = emitter.emit("crawl-done", &serde_json::json!({
-                    "pages_archived": 0,
-                    "cancelled": false,
-                    "error": stderr.to_string(),
-                })).await;
-                return Err(format!("Scrapy process failed: {}", stderr));
-            }
-
-            let _ = emitter.emit("crawl-done", &serde_json::json!({
-                "pages_archived": 0,
-                "cancelled": false,
-                "output_file": out_path,
-            })).await;
-            Ok(())
+    {
+        let mut handle = state.task_handle.lock();
+        if let Some(h) = handle.take() {
+            h.abort();
         }
-        Err(e) => Err(e),
     }
+
+    let new_control = Arc::new(CrawlControl::new());
+    {
+        let mut ctrl = state.control.lock();
+        *ctrl = new_control.clone();
+    }
+
+    let control = new_control;
+    let emitter = TauriEmitter::new(app.clone());
+    let ctx_arc = ctx.inner().clone();
+
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+
+    let out_path = format!("{}/crasp_{}.jl", app_data_dir, chrono::Utc::now().timestamp());
+
+    let handle = tokio::spawn(async move {
+        crate::local_scrapy::run_local_spider_streaming(
+            &config,
+            &out_path,
+            &emitter,
+            &control,
+            &ctx_arc,
+        )
+        .await
+    });
+
+    {
+        let mut h = state.task_handle.lock();
+        *h = Some(handle.abort_handle());
+    }
+
+    Ok(())
 }
 
 #[tauri::command]

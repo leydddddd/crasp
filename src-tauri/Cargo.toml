@@ -30,6 +30,7 @@ phf = { version = "0.11", features = ["macros"] }
 parking_lot = "0.12"
 mongodb = { version = "3", features = ["compat-3-3-0"] }
 bson = "2"
+dirs = "6"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(mobile)"] }

@@ -1,3 +1,5 @@
+export type Engine = "local" | "cloud" | "local-scrapy";
+
 export type ArchiveStatus = "idle" | "crawling" | "paused" | "completed" | "error";
 
 export type PageStatus =
@@ -66,4 +68,16 @@ export interface CrawlStats {
 export interface CrawlDonePayload {
   pages_archived: number;
   cancelled: boolean;
+}
+
+export interface AppStatus {
+  mongo_ok: boolean;
+  zyte_available: boolean;
+  zyte_project: string | null;
+}
+
+export interface CloudProgressPayload {
+  job_key: string;
+  state: string;
+  items_scraped: number | null;
 }

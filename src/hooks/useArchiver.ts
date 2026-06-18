@@ -7,15 +7,22 @@ import type {
   CrawlConfig,
   CrawlDiscoverPayload,
   ScrapeProgressPayload,
+  CloudProgressPayload,
   CrawlStats,
   CrawlDonePayload,
   PageStatus,
+  Engine,
+  AppStatus,
 } from "@/types/archiver";
 
 const MAX_QUEUE_DISPLAY = 500;
 
 export function useArchiver() {
   const [status, setStatus] = useState<ArchiveStatus>("idle");
+  const [engine, setEngine] = useState<Engine>("local");
+  const [appStatus, setAppStatus] = useState<AppStatus | null>(null);
+  const [zyteApiKey, setZyteApiKey] = useState("");
+  const [zyteProjectId, setZyteProjectId] = useState("");
   const [pages, setPages] = useState<ArchivedPage[]>([]);
   const [stats, setStats] = useState<CrawlStats>({
     total: 0,
@@ -115,6 +122,50 @@ export function useArchiver() {
         return;
       }
       unlisteners.push(u4);
+
+      const u5 = await listen<AppStatus>("app-ready", (event) => {
+        setAppStatus(event.payload);
+        if (event.payload.zyte_project) {
+          setZyteProjectId(event.payload.zyte_project);
+        }
+      });
+      if (cancelled) {
+        u5();
+        return;
+      }
+      unlisteners.push(u5);
+
+      const u6 = await listen<{ mongo_ok: boolean; zyte_available: boolean; zyte_project: string | null }>("app-error", (event) => {
+        setAppStatus(event.payload as AppStatus);
+        const errMsg = (event.payload as Record<string, unknown>).error;
+        if (typeof errMsg === "string") {
+          setError(errMsg);
+        }
+      });
+      if (cancelled) {
+        u6();
+        return;
+      }
+      unlisteners.push(u6);
+
+      const u7 = await listen<CloudProgressPayload>("cloud-progress", () => {
+        bumpProgress();
+      });
+      if (cancelled) {
+        u7();
+        return;
+      }
+      unlisteners.push(u7);
+
+      try {
+        const appState = await invoke<AppStatus>("get_app_status");
+        setAppStatus(appState);
+        if (appState.zyte_project) {
+          setZyteProjectId(appState.zyte_project);
+        }
+      } catch {
+        // get_app_status not available yet (app still initializing)
+      }
     };
 
     setup();
@@ -141,12 +192,27 @@ export function useArchiver() {
     setStatus("crawling");
 
     try {
-      await invoke("start_crawl", { config });
+      if (engine === "cloud") {
+        if (!appStatus?.zyte_available && !zyteApiKey.trim()) {
+          setError("Set ZYTE_API_KEY or enter a key to enable cloud engine");
+          setStatus("error");
+          return;
+        }
+        await invoke("start_cloud_crawl", {
+          config,
+          apiKey: zyteApiKey,
+          projectId: zyteProjectId,
+        });
+      } else if (engine === "local-scrapy") {
+        await invoke("local_scrapy_crawl", { config });
+      } else {
+        await invoke("start_crawl", { config });
+      }
     } catch (e) {
       setError(String(e));
       setStatus("error");
     }
-  }, [config]);
+  }, [config, engine, appStatus, zyteApiKey, zyteProjectId]);
 
   const cancelCrawl = useCallback(async () => {
     try {
@@ -193,6 +259,13 @@ export function useArchiver() {
     error,
     config,
     setConfig,
+    engine,
+    setEngine,
+    appStatus,
+    zyteApiKey,
+    setZyteApiKey,
+    zyteProjectId,
+    setZyteProjectId,
     startCrawl,
     cancelCrawl,
     pauseCrawl,

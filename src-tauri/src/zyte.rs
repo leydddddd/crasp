@@ -12,11 +12,11 @@ pub struct ZyteClient {
 pub struct ZyteJobRequest {
     pub project: String,
     pub spider: String,
-    pub add_arguments: ZyeJobArguments,
+    pub add_arguments: ZyteJobArguments,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ZyeJobArguments {
+pub struct ZyteJobArguments {
     pub seed_url: String,
     pub max_depth: u32,
     pub max_pages: u32,
@@ -59,6 +59,13 @@ impl ZyteClient {
         }
     }
 
+    pub fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
+    // TODO: verify endpoint — the Scrapy Cloud Jobs API may use
+    // https://app.zyte.com/api/jobs/run/{project}/ with form-encoded spider args
+    // instead of https://api.zyte.com/api/scrape/jobs
     pub async fn run_job(&self, req: &ZyteJobRequest) -> Result<String, String> {
         let url = format!("{}/api/scrape/jobs", self.base);
         let resp = self

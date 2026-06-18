@@ -156,14 +156,42 @@ Crasp/
 
 Crasp is configured through environment variables (read by `runtime.rs` on startup):
 
-| Variable          | Required | Default                    | Purpose                                           |
-| ----------------- | -------- | -------------------------- | ------------------------------------------------- |
-| `CRASP_MONGO_URI` | no       | `mongodb://localhost:27017`| MongoDB connection string (M10 / M0 / local)      |
-| `ZYTE_API_KEY`    | no       | —                          | Zyte API key; enables the cloud engine when set   |
-| `CRASP_FEED_URI`  | no       | —                          | Scrapy feed output URI (used by the spider)       |
+| Variable            | Required | Default                    | Purpose                                           |
+| ------------------- | -------- | -------------------------- | ------------------------------------------------- |
+| `CRASP_MONGO_URI`   | no       | `mongodb://localhost:27017`| MongoDB connection string (M10 / M0 / local)      |
+| `ZYTE_API_KEY`      | no       | —                          | Zyte API key; enables the cloud engine when set   |
+| `CRASP_ZYTE_PROJECT`| no       | —                          | Zyte Scrapy Cloud project ID (cloud engine)       |
+| `CRASP_FEED_URI`    | no       | —                          | Scrapy feed output URI (used by the spider)       |
 
 The desktop UI drives crawl parameters (seed URL, depth, page cap, concurrency,
 selectors, hash algorithm, preserve-HTML) at runtime — no rebuild required.
+
+---
+
+## Enabling the Cloud and Local-Scrapy Engines
+
+Follow these steps in order:
+
+1. **MongoDB** — Set `CRASP_MONGO_URI` (or use the default local connection). All
+   engines require MongoDB to persist scraped items. Without it, the local Rust
+   engine still runs but items are not stored.
+
+2. **Local Scrapy** — Install Python dependencies for the spider:
+   ```bash
+   pip install scrapy parsel
+   ```
+   Then select **Local Scrapy** in the dashboard engine selector. No additional
+   env vars are needed; the spider runs as a local subprocess.
+
+3. **Zyte Cloud** — Set both `ZYTE_API_KEY` and `CRASP_ZYTE_PROJECT` in your
+   environment (or enter them in the dashboard's **Cloud** engine panel). The
+   dashboard shows a green dot when Zyte is configured.
+
+The **Engine** selector in the dashboard sidebar switches between the three
+engines at runtime. When **Cloud** is selected, two input fields appear for
+the API key and project ID (project ID is pre-filled from `CRASP_ZYTE_PROJECT`
+when available). The **Services** row shows real-time readiness of MongoDB and
+Zyte with colored indicators.
 
 ---
 
@@ -212,6 +240,7 @@ scrapy crawl crasp_archive -a seed_url=https://example.com -a max_depth=3 -a max
 | `resume_crawl`     | —             | Resume a paused crawl                                  |
 | `validate_url`     | —             | Validate a seed URL                                    |
 | `default_config`   | —             | Return the default `CrawlConfig`                       |
+| `get_app_status`   | —             | Return MongoDB/Zyte readiness flags (for UI polling)  |
 
 ---
 

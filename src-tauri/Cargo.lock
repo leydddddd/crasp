@@ -690,6 +690,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "digest",
+ "dirs",
  "ego-tree",
  "hex",
  "md-5",
