@@ -692,6 +692,7 @@ dependencies = [
  "digest",
  "dirs",
  "ego-tree",
+ "futures-util",
  "hex",
  "md-5",
  "mongodb",

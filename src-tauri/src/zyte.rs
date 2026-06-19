@@ -45,6 +45,13 @@ pub struct ZyteProgress {
     pub requests: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZyteConnectionStatus {
+    pub ok: bool,
+    pub project_name: Option<String>,
+    pub message: Option<String>,
+}
+
 impl ZyteClient {
     pub fn new(api_key: String) -> Self {
         let http = reqwest::Client::builder()
@@ -55,7 +62,7 @@ impl ZyteClient {
         Self {
             http,
             api_key,
-            base: "https://api.zyte.com".to_string(),
+            base: "https://app.zyte.com".to_string(),
         }
     }
 
@@ -63,16 +70,64 @@ impl ZyteClient {
         &self.api_key
     }
 
-    // TODO: verify endpoint — the Scrapy Cloud Jobs API may use
-    // https://app.zyte.com/api/jobs/run/{project}/ with form-encoded spider args
-    // instead of https://api.zyte.com/api/scrape/jobs
+    pub async fn test_connection(
+        &self,
+        project_id: &str,
+    ) -> Result<ZyteConnectionStatus, String> {
+        let url = format!("{}/api/projects/{}", self.base, project_id);
+        let resp = self
+            .http
+            .get(&url)
+            .basic_auth(&self.api_key, Some(""))
+            .send()
+            .await
+            .map_err(|e| format!("Zyte connection test failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Ok(ZyteConnectionStatus {
+                ok: false,
+                project_name: None,
+                message: Some(format!("HTTP {}: {}", status, body.trim())),
+            });
+        }
+
+        let project: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse Zyte project response: {}", e))?;
+
+        let project_name = project
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        Ok(ZyteConnectionStatus {
+            ok: true,
+            project_name,
+            message: None,
+        })
+    }
+
     pub async fn run_job(&self, req: &ZyteJobRequest) -> Result<String, String> {
-        let url = format!("{}/api/scrape/jobs", self.base);
+        let url = format!("{}/api/jobs/run/{}", self.base, req.project);
+
+        let form = vec![
+            ("spider", req.spider.clone()),
+            ("add_arguments.seed_url", req.add_arguments.seed_url.clone()),
+            ("add_arguments.max_depth", req.add_arguments.max_depth.to_string()),
+            ("add_arguments.max_pages", req.add_arguments.max_pages.to_string()),
+            ("add_arguments.css_selectors", req.add_arguments.css_selectors.clone()),
+            ("add_arguments.preserve_html", req.add_arguments.preserve_html.clone()),
+            ("add_arguments.hash_algorithm", req.add_arguments.hash_algorithm.clone()),
+        ];
+
         let resp = self
             .http
             .post(&url)
             .basic_auth(&self.api_key, Some(""))
-            .json(req)
+            .form(&form)
             .send()
             .await
             .map_err(|e| format!("Zyte API request failed: {}", e))?;
@@ -99,7 +154,7 @@ impl ZyteClient {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-            let url = format!("{}/api/scrape/jobs/{}", self.base, job_key);
+            let url = format!("{}/api/jobs/{}", self.base, job_key);
             let resp = self
                 .http
                 .get(&url)
@@ -148,7 +203,7 @@ impl ZyteClient {
 
         loop {
             let url = format!(
-                "{}/api/scrape/jobs/{}/items?start={}&count={}",
+                "{}/api/items/{}?start={}&count={}",
                 self.base, job_key, start, batch_size
             );
 

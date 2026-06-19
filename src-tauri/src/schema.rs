@@ -40,6 +40,7 @@ pub struct PageDoc {
     pub title: String,
     pub status: String,
     pub status_code: i32,
+    pub status_reason: Option<String>,
     pub content: String,
     pub content_format: String,
     pub content_bytes: Option<mongodb::bson::Binary>,

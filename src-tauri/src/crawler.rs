@@ -15,6 +15,8 @@ use url::Url;
 use phf::phf_set;
 
 use crate::commands::TauriEmitter;
+use crate::commands::{persist_items_with_outcome, emit_persist_stages};
+use crate::logging::emit_log;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrawlConfig {
@@ -46,6 +48,27 @@ impl Default for CrawlConfig {
             hash_algorithm: HashAlgorithm::Sha256,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PersistTarget {
+    Mongo { db: String, collection: String },
+    LocalFile { path: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "stage", rename_all = "camelCase")]
+pub enum PageStage {
+    Discovered,
+    Fetching,
+    Fetched { status_code: u16 },
+    Parsing,
+    Sanitizing,
+    Preserving,
+    Hashing,
+    Persisting { target: PersistTarget },
+    Persisted { target: PersistTarget },
+    Failed { failed_stage: String, reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,21 +171,37 @@ impl CrawlControl {
     }
 }
 
+/// Atomically reserve a budget slot for a URL to be crawled.
+///
+/// Uses fetch_add + rollback to close the TOCTOU window that existed when
+/// load() and fetch_add() were separate operations. Returns true if a slot
+/// was reserved (the caller should proceed), false if the budget is exhausted.
+///
+/// If the counter was already >= max_pages, the increment is rolled back
+/// and the URL is effectively rejected — but it may already be in the
+/// visited set, which is harmless and prevents redundant re-injection.
+fn try_reserve_slot(
+    counter: &std::sync::atomic::AtomicU32,
+    max_pages: u32,
+) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    // fetch_add returns the PREVIOUS value.
+    let prev = counter.fetch_add(1, SeqCst);
+    if prev >= max_pages {
+        counter.fetch_sub(1, SeqCst);
+        false
+    } else {
+        true
+    }
+}
+
 pub struct Crawler {
     client: reqwest::Client,
 }
 
 impl Crawler {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .user_agent("Crasp/0.1 (archiver; +https://crasp.app)")
-            .gzip(true)
-            .brotli(true)
-            .deflate(true)
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("failed to build HTTP client");
+        let client = crate::ssrf::build_safe_http_client();
 
         Self { client }
     }
@@ -172,6 +211,9 @@ impl Crawler {
         config: CrawlConfig,
         emitter: TauriEmitter,
         control: &CrawlControl,
+        crawl_id: &str,
+        ctx: &Arc<crate::runtime::AppContext>,
+        app_data_dir: &str,
     ) -> Result<Vec<ArchivedPage>, String> {
         let seed = Url::parse(&config.seed_url).map_err(|e| e.to_string())?;
         let domain = seed.domain().ok_or("seed URL has no domain")?.to_string();
@@ -184,17 +226,20 @@ impl Crawler {
         let pages_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        // Mark seed URL as visited (prevents duplicate injection by the
+        // collector), then atomically reserve a budget slot and send.
         {
             let key = normalize_url(&config.seed_url);
             visited.insert(key);
         }
-        pages_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        let _ = work_tx.send(FrontierItem {
-            url: config.seed_url.clone(),
-            depth: 0,
-            parent: None,
-        }).await;
+        if try_reserve_slot(&pages_count, config.max_pages) {
+            let _ = work_tx.send(FrontierItem {
+                url: config.seed_url.clone(),
+                depth: 0,
+                parent: None,
+            }).await;
+        }
 
         let client = self.client;
         let semaphore = Arc::new(tokio::sync::Semaphore::new(config.concurrency));
@@ -204,6 +249,7 @@ impl Crawler {
 
         let cfg_worker = config.clone();
         let emitter_worker = emitter.clone();
+        let crawl_id_worker = crawl_id.to_string();
 
         let mut worker_cancel_rx = control.cancel_rx();
         let worker_pause_rx = control.pause_rx();
@@ -235,7 +281,7 @@ impl Crawler {
                         break;
                     }
 
-                    let permit = match semaphore.clone().acquire_owned().await {
+                    let mut permit = match semaphore.clone().acquire_owned().await {
                         Ok(p) => p,
                         Err(_) => break,
                     };
@@ -244,28 +290,39 @@ impl Crawler {
                         break;
                     }
 
+                    // If paused, release the semaphore permit so other work
+                    // can proceed when we resume. Wait efficiently on both
+                    // the pause and cancel channels — no yield_now() spin.
                     let mut pause_rx = worker_pause_rx.clone();
                     if *pause_rx.borrow() {
+                        // Drop the permit while paused to free the slot.
+                        drop(permit);
+
                         loop {
                             tokio::select! {
-                                _ = pause_rx.changed() => {
+                                result = pause_rx.changed() => {
+                                    result.ok();
                                     if !*pause_rx.borrow() {
                                         break;
                                     }
                                 }
-                                _ = tokio::task::yield_now() => {
-                                    if cancelled_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                                        break;
-                                    }
-                                    if !*pause_rx.borrow() {
+                                _ = worker_cancel_rx.changed() => {
+                                    if *worker_cancel_rx.borrow() {
                                         break;
                                     }
                                 }
                             }
                         }
+
                         if cancelled_flag.load(std::sync::atomic::Ordering::SeqCst) {
                             break;
                         }
+
+                        // Re-acquire the permit after resuming.
+                        permit = match semaphore.clone().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => break,
+                        };
                     }
 
                     if cancelled_flag.load(std::sync::atomic::Ordering::SeqCst) {
@@ -276,10 +333,11 @@ impl Crawler {
                     let cf = cfg_worker.clone();
                     let em = emitter_worker.clone();
                     let tx = done_tx.clone();
+                    let cid = crawl_id_worker.clone();
 
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let output = process_page(c, item, &cf, &em).await;
+                        let output = process_page(c, item, &cf, &em, &cid).await;
                         let _ = tx.send(output).await;
                     });
                 }
@@ -325,16 +383,16 @@ impl Crawler {
                             continue;
                         }
 
-                        let should_inject = {
-                            let current = i_pages_count.load(std::sync::atomic::Ordering::SeqCst);
-                            if current >= i_max_pages {
-                                continue;
-                            }
-                            i_visited.insert(key)
-                        };
+                        let should_inject = i_visited.insert(key);
 
                         if should_inject {
-                            i_pages_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            // Atomically reserve a budget slot. If the budget
+                            // is exhausted, the URL stays in visited (harmless —
+                            // prevents re-injection if we see it again later),
+                            // but we don't schedule or count it.
+                            if !try_reserve_slot(&i_pages_count, i_max_pages) {
+                                continue;
+                            }
 
                             let _ = i_emitter.emit("crawl-discover", &serde_json::json!({
                                 "url": link,
@@ -353,6 +411,11 @@ impl Crawler {
             }
         });
 
+        // ---- Channel lifetime invariants ----
+        // work_tx: dropped below. The collector holds inject_tx (a clone).
+        //          work_rx closes only after the collector also drops inject_tx.
+        // done_tx: each spawned worker holds a clone. done_rx closes only after
+        //          all workers exit. We drop our copy here.
         drop(work_tx);
         drop(done_tx);
 
@@ -360,6 +423,12 @@ impl Crawler {
         let emitter_result = emitter.clone();
         let mut cancel_rx = control.cancel_rx();
         let mut pause_rx = control.pause_rx();
+
+        let mut persist_buffer: Vec<serde_json::Value> = Vec::with_capacity(50);
+        let fallback_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let crawl_id_owned = crawl_id.to_string();
+        let app_data_dir_owned = app_data_dir.to_string();
+        let ctx_result = ctx.clone();
 
         loop {
             if *pause_rx.borrow() {
@@ -384,7 +453,18 @@ impl Crawler {
                     match page {
                         Some(p) => {
                             let _ = emitter_result.emit("archive-success", &serde_json::to_value(&p).unwrap_or_default()).await;
-                            results.push(p);
+                            results.push(p.clone());
+                            persist_buffer.push(serde_json::to_value(&p).unwrap_or_default());
+                            if persist_buffer.len() >= 50 {
+                                let outcomes = persist_items_with_outcome(
+                                    &ctx_result,
+                                    std::mem::take(&mut persist_buffer),
+                                    &crawl_id_owned,
+                                    &app_data_dir_owned,
+                                    &fallback_active,
+                                ).await;
+                                emit_persist_stages(&emitter_result, &crawl_id_owned, outcomes).await;
+                            }
                         }
                         None => break,
                     }
@@ -403,6 +483,17 @@ impl Crawler {
             }
         }
 
+        if !persist_buffer.is_empty() {
+            let outcomes = persist_items_with_outcome(
+                &ctx_result,
+                std::mem::take(&mut persist_buffer),
+                &crawl_id_owned,
+                &app_data_dir_owned,
+                &fallback_active,
+            ).await;
+            emit_persist_stages(&emitter_result, &crawl_id_owned, outcomes).await;
+        }
+
         cancelled_flag.store(true, std::sync::atomic::Ordering::SeqCst);
 
         worker_loop.abort();
@@ -414,6 +505,7 @@ impl Crawler {
         let _ = emitter.emit("crawl-done", &serde_json::json!({
             "pages_archived": results.len(),
             "cancelled": cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "crawl_id": crawl_id,
         })).await;
 
         Ok(results)
@@ -425,6 +517,7 @@ async fn process_page(
     item: FrontierItem,
     config: &CrawlConfig,
     emitter: &TauriEmitter,
+    crawl_id: &str,
 ) -> WorkerOutput {
     let url_str = item.url.clone();
     let depth = item.depth;
@@ -447,25 +540,84 @@ async fn process_page(
         "depth": depth,
     })).await;
 
+    let _ = emitter.emit("page-stage", &serde_json::json!({
+        "url": url_str,
+        "crawl_id": crawl_id,
+        "stage": PageStage::Discovered,
+    })).await;
+
+    let _ = emitter.emit("page-stage", &serde_json::json!({
+        "url": url_str,
+        "crawl_id": crawl_id,
+        "stage": PageStage::Fetching,
+    })).await;
+
     let html_text = {
         let response = match client.get(&url_str).send().await {
             Ok(r) => r,
             Err(e) => {
                 page.status = PageStatus::Failed(e.to_string());
+                let _ = emit_log(emitter, "error", "local", &format!("Fetch failed for {}: {}", url_str, e));
+                let _ = emitter.emit("page-stage", &serde_json::json!({
+                    "url": url_str,
+                    "crawl_id": crawl_id,
+                    "stage": PageStage::Failed { failed_stage: "fetching".to_string(), reason: e.to_string() },
+                })).await;
+                let _ = emitter.emit("archive-failed", &serde_json::to_value(&page).unwrap_or_default()).await;
+                return WorkerOutput { page, found_links: vec![] };
+            }
+        };
+
+        let initial_url = Url::parse(&url_str).unwrap_or_else(|_| Url::parse("http://invalid/").unwrap());
+        let response = match crate::ssrf::follow_redirects(&client, initial_url, response).await {
+            Ok(r) => r,
+            Err(e) => {
+                page.status = PageStatus::Failed(e.clone());
+                let _ = emit_log(emitter, "error", "local", &format!("SSRF redirect rejected for {}: {}", url_str, e));
+                let _ = emitter.emit("page-stage", &serde_json::json!({
+                    "url": url_str,
+                    "crawl_id": crawl_id,
+                    "stage": PageStage::Failed { failed_stage: "redirect".to_string(), reason: e.clone() },
+                })).await;
+                let _ = emitter.emit("archive-failed", &serde_json::to_value(&page).unwrap_or_default()).await;
                 return WorkerOutput { page, found_links: vec![] };
             }
         };
 
         let status_code = response.status();
         if !status_code.is_success() {
-            page.status = PageStatus::Failed(format!("HTTP {}", status_code));
+            let reason = format!("HTTP {}", status_code);
+            page.status = PageStatus::Failed(reason.clone());
+            let _ = emit_log(emitter, "warn", "local", &format!("Non-success HTTP {} for {}", status_code, url_str));
+            let _ = emitter.emit("page-stage", &serde_json::json!({
+                "url": url_str,
+                "crawl_id": crawl_id,
+                "stage": PageStage::Failed { failed_stage: "fetching".to_string(), reason },
+            })).await;
+            let _ = emitter.emit("archive-failed", &serde_json::to_value(&page).unwrap_or_default()).await;
             return WorkerOutput { page, found_links: vec![] };
         }
 
+        let code = status_code.as_u16();
+
         match response.text().await {
-            Ok(t) => t,
+            Ok(t) => {
+                let _ = emitter.emit("page-stage", &serde_json::json!({
+                    "url": url_str,
+                    "crawl_id": crawl_id,
+                    "stage": PageStage::Fetched { status_code: code },
+                })).await;
+                t
+            }
             Err(e) => {
                 page.status = PageStatus::Failed(e.to_string());
+                let _ = emit_log(emitter, "error", "local", &format!("Body read failed for {}: {}", url_str, e));
+                let _ = emitter.emit("page-stage", &serde_json::json!({
+                    "url": url_str,
+                    "crawl_id": crawl_id,
+                    "stage": PageStage::Failed { failed_stage: "fetching".to_string(), reason: e.to_string() },
+                })).await;
+                let _ = emitter.emit("archive-failed", &serde_json::to_value(&page).unwrap_or_default()).await;
                 return WorkerOutput { page, found_links: vec![] };
             }
         }
@@ -477,6 +629,12 @@ async fn process_page(
         "url": url_str,
         "status": "scraping",
         "depth": depth,
+    })).await;
+
+    let _ = emitter.emit("page-stage", &serde_json::json!({
+        "url": url_str,
+        "crawl_id": crawl_id,
+        "stage": PageStage::Parsing,
     })).await;
 
     let (title, links, extracted) = {
@@ -495,6 +653,13 @@ async fn process_page(
         .await
         .unwrap_or_else(|_| (String::new(), vec![], String::new()))
     };
+
+    let stage = if config.preserve_html { PageStage::Sanitizing } else { PageStage::Preserving };
+    let _ = emitter.emit("page-stage", &serde_json::json!({
+        "url": url_str,
+        "crawl_id": crawl_id,
+        "stage": stage,
+    })).await;
 
     if title.is_empty() {
         page.title = url_str.clone();
@@ -515,6 +680,12 @@ async fn process_page(
         "url": url_str,
         "status": "archiving",
         "depth": depth,
+    })).await;
+
+    let _ = emitter.emit("page-stage", &serde_json::json!({
+        "url": url_str,
+        "crawl_id": crawl_id,
+        "stage": PageStage::Hashing,
     })).await;
 
     let hash = compute_hash(&extracted, &config.hash_algorithm);
@@ -660,82 +831,91 @@ impl TagSets {
 
 fn sanitize_to_html(elements: &[scraper::ElementRef]) -> String {
     let sets = TagSets::global();
-    let mut output = String::new();
+    let mut output = String::with_capacity(8192);
 
     for el in elements {
         for child_node_ref in el.children() {
-            output.push_str(&render_node_html(&child_node_ref, &sets));
+            render_node_html_into(&child_node_ref, sets, &mut output);
         }
     }
 
     output
 }
 
-fn render_node_html(node_ref: &NodeRef<Node>, sets: &TagSets) -> String {
+fn render_node_html_into(node_ref: &NodeRef<Node>, sets: &TagSets, out: &mut String) {
     match node_ref.value() {
-        Node::Text(t) => html_escape(&t.text),
+        Node::Text(t) => {
+            html_escape_into(&t.text, out);
+        }
         Node::Element(el) => {
             let tag = el.name.local.as_ref();
 
             if sets.is_strip(tag) {
-                return String::new();
+                return;
             }
 
-            let attrs: String = el
-                .attrs
-                .iter()
-                .filter(|(k, _)| !sets.is_tracking_attr(k.local.as_ref()) && k.local.as_ref() != "style")
-                .map(|(k, v)| format!(" {}=\"{}\"", k.local, html_escape(v)))
-                .collect();
+            out.push('<');
+            out.push_str(tag);
+
+            for (k, v) in el.attrs.iter() {
+                if sets.is_tracking_attr(k.local.as_ref()) || k.local.as_ref() == "style" {
+                    continue;
+                }
+                out.push(' ');
+                out.push_str(k.local.as_ref());
+                out.push_str("=\"");
+                html_escape_into(v, out);
+                out.push('"');
+            }
 
             if sets.is_void(tag) {
-                return format!("<{}{} />", tag, attrs);
+                out.push_str(" />");
+                return;
             }
 
-            let inner: String = node_ref.children().map(|c| render_node_html(&c, sets)).collect();
+            out.push('>');
 
-            format!("<{}{}>{}</{}>", tag, attrs, inner, tag)
+            for c in node_ref.children() {
+                render_node_html_into(&c, sets, out);
+            }
+
+            out.push_str("</");
+            out.push_str(tag);
+            out.push('>');
         }
-        Node::Comment(_) => String::new(),
-        _ => String::new(),
+        Node::Comment(_) => {}
+        _ => {}
     }
 }
 
 fn sanitize_to_text(elements: &[scraper::ElementRef]) -> String {
     let sets = TagSets::global();
-    let mut output = Vec::new();
+    let mut parts = Vec::new();
 
     for el in elements {
-        let text = collect_text_from_element(el, &sets);
-        if !text.trim().is_empty() {
-            output.push(text.trim().to_string());
+        let mut buf = String::with_capacity(2048);
+        for child_node_ref in el.children() {
+            collect_text_recursive_into(&child_node_ref, sets, &mut buf);
+        }
+        let trimmed = buf.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
         }
     }
 
-    output.join("\n\n")
+    parts.join("\n\n")
 }
 
-fn collect_text_from_element(el: &scraper::ElementRef, sets: &TagSets) -> String {
-    let mut result = String::new();
-    for child_node_ref in el.children() {
-        result.push_str(&collect_text_recursive(&child_node_ref, sets));
-    }
-    result
-}
-
-fn collect_text_recursive(node_ref: &NodeRef<Node>, sets: &TagSets) -> String {
+fn collect_text_recursive_into(node_ref: &NodeRef<Node>, sets: &TagSets, out: &mut String) {
     match node_ref.value() {
-        Node::Text(t) => t.text.to_string(),
+        Node::Text(t) => {
+            out.push_str(&t.text);
+        }
         Node::Element(el) => {
             let tag = el.name.local.as_ref();
             if sets.is_strip(tag) {
-                return String::new();
+                return;
             }
-
-            let inner: String = node_ref
-                .children()
-                .map(|c| collect_text_recursive(&c, sets))
-                .collect();
 
             let is_block = matches!(
                 tag,
@@ -744,27 +924,45 @@ fn collect_text_recursive(node_ref: &NodeRef<Node>, sets: &TagSets) -> String {
                     | "article" | "main" | "header" | "footer" | "tr"
             );
 
+            let start_len = out.len();
+
+            for c in node_ref.children() {
+                collect_text_recursive_into(&c, sets, out);
+            }
+
             if is_block {
+                let inner = &out[start_len..];
                 let trimmed = inner.trim();
                 if trimmed.is_empty() {
-                    String::new()
+                    out.truncate(start_len);
                 } else {
-                    format!("\n{}\n", trimmed)
+                    // Clone trimmed to release the immutable borrow on `out`,
+                    // then truncate and rewrite. This allocates once per block
+                    // element — a small cost compared to the O(n²) avoided
+                    // by not returning Strings from every recursive call.
+                    let trimmed_owned = trimmed.to_string();
+                    out.truncate(start_len);
+                    out.push('\n');
+                    out.push_str(&trimmed_owned);
+                    out.push('\n');
                 }
-            } else {
-                inner
             }
         }
-        Node::Comment(_) => String::new(),
-        _ => String::new(),
+        Node::Comment(_) => {}
+        _ => {}
     }
 }
 
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&")
-        .replace('<', "<")
-        .replace('>', ">")
-        .replace('"', "&#34;")
+fn html_escape_into(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&"),
+            '<' => out.push_str("<"),
+            '>' => out.push_str(">"),
+            '"' => out.push_str("&#34;"),
+            _ => out.push(c),
+        }
+    }
 }
 
 fn compute_hash(content: &str, algorithm: &HashAlgorithm) -> String {

@@ -3,13 +3,6 @@ use mongodb::IndexModel;
 
 use crate::schema::{CrawlDoc, HashDoc, PageDoc};
 
-#[derive(Clone, serde::Serialize)]
-pub struct AppStatus {
-    pub mongo_ok: bool,
-    pub zyte_available: bool,
-    pub zyte_project: Option<String>,
-}
-
 #[derive(Clone)]
 pub struct ArchiveStore {
     database: mongodb::Database,
@@ -50,7 +43,7 @@ impl ArchiveStore {
                     .keys(doc! { "crawl_id": 1, "depth": 1 })
                     .build(),
                 IndexModel::builder()
-                    .keys(doc! { "url_normalized": 1 })
+                    .keys(doc! { "crawl_id": 1, "url_normalized": 1 })
                     .options(mongodb::options::IndexOptions::builder().unique(true).build())
                     .build(),
                 IndexModel::builder()
@@ -113,12 +106,30 @@ pub async fn persist_batch(
             continue;
         }
 
-        store
+        // Unordered insert: individual duplicate-key errors are tolerated
+        // so that re-crawling a previously-archived domain under a new
+        // crawl_id does not reject the entire batch.
+        let options = mongodb::options::InsertManyOptions::builder()
+            .ordered(false)
+            .build();
+
+        let result = store
             .database
             .collection::<mongodb::bson::Document>("pages")
             .insert_many(docs)
-            .await
-            .map_err(|e| format!("Batch insert failed: {}", e))?;
+            .with_options(options)
+            .await;
+
+        match result {
+            Ok(_) => {}
+            Err(e) => {
+                // E11000 duplicate key is expected when a URL was archived
+                // in a previous crawl; surface only genuine errors.
+                if !e.to_string().contains("E11000") {
+                    eprintln!("Warning: batch insert error: {}", e);
+                }
+            }
+        }
     }
 
     Ok(())
@@ -180,11 +191,50 @@ pub async fn persist_items(
             .get("depth")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
-        let status = item
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Completed")
-            .to_string();
+
+        // ── Structural status handling (WI-29) ──────────────────────────
+        // serde serializes PageStatus as:
+        //   unit variants: "Completed" | "Pending" | ...
+        //   tuple variants: {"Failed":"reason"} | {"Skipped":"reason"}
+        // We preserve the discriminant in `status` and the reason in
+        // `status_reason`, never silently defaulting to "Completed".
+        let (status, status_reason) = match item.get("status") {
+            Some(serde_json::Value::String(s)) => {
+                (s.clone(), None)
+            }
+            Some(serde_json::Value::Object(map)) => {
+                if let Some(v) = map.get("Failed").and_then(|v| v.as_str()) {
+                    ("Failed".to_string(), Some(v.to_string()))
+                } else if let Some(v) = map.get("Skipped").and_then(|v| v.as_str()) {
+                    ("Skipped".to_string(), Some(v.to_string()))
+                } else {
+                    eprintln!("Warning: unknown status object shape for URL {}: {:?}", url, map);
+                    ("Unknown".to_string(), None)
+                }
+            }
+            Some(other) => {
+                eprintln!("Warning: unexpected status type for URL {}: {:?}", url, other);
+                ("Unknown".to_string(), None)
+            }
+            None => {
+                // Derive from status_code when no explicit status is present.
+                let code = item
+                    .get("status_code")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as i32;
+                if (200..300).contains(&code) {
+                    ("Completed".to_string(), None)
+                } else {
+                    let reason = format!("HTTP {}", code);
+                    ("Failed".to_string(), Some(reason))
+                }
+            }
+        };
+
+        let status_code = item
+            .get("status_code")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as i32;
         let content = item
             .get("content")
             .and_then(|v| v.as_str())
@@ -220,7 +270,8 @@ pub async fn persist_items(
             depth,
             title,
             status,
-            status_code: 200,
+            status_code,
+            status_reason,
             content,
             content_format: content_format.to_string(),
             content_bytes: None,

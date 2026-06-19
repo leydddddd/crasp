@@ -1,7 +1,7 @@
 {
   "$schema": "https://cdn.tauri.app/v2/schemas/2.0.0/config.json",
   "productName": "Crasp",
-  "version": "0.1.0",
+  "version": "0.1.5",
   "identifier": "com.crasp.devs",
   "build": {
     "frontendDist": "../dist",
@@ -21,7 +21,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'"
     }
   },
   "bundle": {

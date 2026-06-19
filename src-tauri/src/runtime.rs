@@ -1,8 +1,27 @@
 use std::env;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::store::ArchiveStore;
 use crate::zyte::ZyteClient;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceState {
+    NotConfigured,
+    ConfiguredUnverified,
+    Connected,
+    Unreachable,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct AppStatus {
+    pub mongo_state: ServiceState,
+    pub mongo_detail: Option<String>,
+    pub zyte_state: ServiceState,
+    pub zyte_detail: Option<String>,
+    pub zyte_project: Option<String>,
+}
 
 pub struct AppContext {
     pub store: Option<Arc<ArchiveStore>>,
@@ -10,6 +29,30 @@ pub struct AppContext {
     pub zyte_project: Option<String>,
     #[allow(dead_code)]
     pub http: Arc<reqwest::Client>,
+    mongo_state: AtomicU8,
+    mongo_detail: parking_lot::Mutex<Option<String>>,
+    zyte_state: AtomicU8,
+    zyte_detail: parking_lot::Mutex<Option<String>>,
+}
+
+impl ServiceState {
+    fn to_u8(self) -> u8 {
+        match self {
+            ServiceState::NotConfigured => 0,
+            ServiceState::ConfiguredUnverified => 1,
+            ServiceState::Connected => 2,
+            ServiceState::Unreachable => 3,
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            2 => ServiceState::Connected,
+            3 => ServiceState::Unreachable,
+            1 => ServiceState::ConfiguredUnverified,
+            _ => ServiceState::NotConfigured,
+        }
+    }
 }
 
 impl AppContext {
@@ -17,16 +60,15 @@ impl AppContext {
         let mongo_uri = env::var("CRASP_MONGO_URI")
             .unwrap_or_else(|_| "mongodb://localhost:27017".to_string());
 
-        let store = match ArchiveStore::from_uri(&mongo_uri).await {
+        let (store, mongo_initial) = match ArchiveStore::from_uri(&mongo_uri).await {
             Ok(s) => {
                 if let Err(e) = s.ensure_indexes().await {
                     eprintln!("Warning: index creation failed: {}", e);
                 }
-                Some(Arc::new(s))
+                (Some(Arc::new(s)), ServiceState::ConfiguredUnverified)
             }
-            Err(e) => {
-                eprintln!("Warning: MongoDB connection failed: {}", e);
-                None
+            Err(_) => {
+                (None, ServiceState::NotConfigured)
             }
         };
 
@@ -37,6 +79,12 @@ impl AppContext {
                 Some(Arc::new(ZyteClient::new(api_key)))
             }
         });
+
+        let zyte_initial = if zyte.is_some() {
+            ServiceState::ConfiguredUnverified
+        } else {
+            ServiceState::NotConfigured
+        };
 
         let zyte_project = env::var("CRASP_ZYTE_PROJECT").ok().filter(|s| !s.is_empty());
 
@@ -53,6 +101,10 @@ impl AppContext {
             zyte,
             zyte_project,
             http,
+            mongo_state: AtomicU8::new(mongo_initial.to_u8()),
+            mongo_detail: parking_lot::Mutex::new(None),
+            zyte_state: AtomicU8::new(zyte_initial.to_u8()),
+            zyte_detail: parking_lot::Mutex::new(None),
         })
     }
 
@@ -70,14 +122,46 @@ impl AppContext {
             zyte: None,
             zyte_project: None,
             http,
+            mongo_state: AtomicU8::new(ServiceState::NotConfigured.to_u8()),
+            mongo_detail: parking_lot::Mutex::new(None),
+            zyte_state: AtomicU8::new(ServiceState::NotConfigured.to_u8()),
+            zyte_detail: parking_lot::Mutex::new(None),
         }
     }
 
-    pub fn mongo_ok(&self) -> bool {
-        self.store.is_some()
+    pub fn get_mongo_state(&self) -> ServiceState {
+        ServiceState::from_u8(self.mongo_state.load(Ordering::SeqCst))
     }
 
-    pub fn zyte_available(&self) -> bool {
-        self.zyte.is_some()
+    pub fn get_zyte_state(&self) -> ServiceState {
+        ServiceState::from_u8(self.zyte_state.load(Ordering::SeqCst))
+    }
+
+    pub fn get_mongo_detail(&self) -> Option<String> {
+        self.mongo_detail.lock().clone()
+    }
+
+    pub fn get_zyte_detail(&self) -> Option<String> {
+        self.zyte_detail.lock().clone()
+    }
+
+    pub fn set_mongo_state(&self, state: ServiceState, detail: Option<String>) {
+        self.mongo_state.store(state.to_u8(), Ordering::SeqCst);
+        *self.mongo_detail.lock() = detail;
+    }
+
+    pub fn set_zyte_state(&self, state: ServiceState, detail: Option<String>) {
+        self.zyte_state.store(state.to_u8(), Ordering::SeqCst);
+        *self.zyte_detail.lock() = detail;
+    }
+
+    pub fn to_app_status(&self) -> AppStatus {
+        AppStatus {
+            mongo_state: self.get_mongo_state(),
+            mongo_detail: self.get_mongo_detail(),
+            zyte_state: self.get_zyte_state(),
+            zyte_detail: self.get_zyte_detail(),
+            zyte_project: self.zyte_project.clone(),
+        }
     }
 }
