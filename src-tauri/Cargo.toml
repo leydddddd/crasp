@@ -35,3 +35,6 @@ futures-util = "0.3"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(mobile)"] }
+
+[dev-dependencies]
+tempfile = "3"

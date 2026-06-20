@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -32,6 +32,16 @@ pub struct CrawlState {
     control: parking_lot::Mutex<Arc<CrawlControl>>,
     task_handle: parking_lot::Mutex<Option<tokio::task::AbortHandle>>,
     crawl_id: parking_lot::Mutex<Option<String>>,
+    outcomes: Arc<SharedCrawlOutcomes>,
+}
+
+#[derive(Debug, Default)]
+pub struct SharedCrawlOutcomes {
+    pub pages_completed: std::sync::atomic::AtomicU64,
+    pub pages_failed: std::sync::atomic::AtomicU64,
+    pub pages_skipped: std::sync::atomic::AtomicU64,
+    pub used_mongo: std::sync::atomic::AtomicBool,
+    pub local_file_path: parking_lot::Mutex<Option<String>>,
 }
 
 impl CrawlState {
@@ -40,16 +50,52 @@ impl CrawlState {
             control: parking_lot::Mutex::new(Arc::new(CrawlControl::new())),
             task_handle: parking_lot::Mutex::new(None),
             crawl_id: parking_lot::Mutex::new(None),
+            outcomes: Arc::new(SharedCrawlOutcomes::default()),
         }
     }
 
     pub fn set_crawl_id(&self, id: String) {
         *self.crawl_id.lock() = Some(id);
+        self.outcomes.reset();
     }
 
     #[allow(dead_code)]
     pub fn get_crawl_id(&self) -> Option<String> {
         self.crawl_id.lock().clone()
+    }
+
+    pub fn outcomes_arc(&self) -> Arc<SharedCrawlOutcomes> {
+        self.outcomes.clone()
+    }
+}
+
+impl SharedCrawlOutcomes {
+    pub fn reset(&self) {
+        self.pages_completed.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.pages_failed.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.pages_skipped.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.used_mongo.store(false, std::sync::atomic::Ordering::SeqCst);
+        *self.local_file_path.lock() = None;
+    }
+
+    pub fn build_crawl_done_summary(&self, pages_archived: u64, cancelled: bool, crawl_id: &str) -> CrawlDoneSummary {
+        let used_mongo = self.used_mongo.load(std::sync::atomic::Ordering::SeqCst);
+        let local_path = self.local_file_path.lock().clone();
+        let storage_used = match (used_mongo, local_path) {
+            (true, Some(path)) => Some(StorageUsed::Both { local_path: path }),
+            (true, None) => Some(StorageUsed::Mongo),
+            (false, Some(path)) => Some(StorageUsed::LocalFile { path }),
+            (false, None) => None,
+        };
+        CrawlDoneSummary {
+            pages_archived,
+            pages_completed: self.pages_completed.load(std::sync::atomic::Ordering::SeqCst),
+            pages_failed: self.pages_failed.load(std::sync::atomic::Ordering::SeqCst),
+            pages_skipped: self.pages_skipped.load(std::sync::atomic::Ordering::SeqCst),
+            cancelled,
+            crawl_id: crawl_id.to_string(),
+            storage_used,
+        }
     }
 }
 
@@ -60,13 +106,13 @@ pub enum PersistOutcome {
     Failed { reason: String },
 }
 
-fn local_fallback_path(app_data_dir: &str, crawl_id: &str) -> PathBuf {
+pub fn local_fallback_path(app_data_dir: &str, crawl_id: &str) -> PathBuf {
     let dir = PathBuf::from(app_data_dir);
     let _ = std::fs::create_dir_all(&dir);
     dir.join(format!("crawl-{}.jl", crawl_id))
 }
 
-fn append_to_jl(path: &PathBuf, items: &[serde_json::Value]) -> Result<(), String> {
+pub fn append_to_jl(path: &PathBuf, items: &[serde_json::Value]) -> Result<(), String> {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -203,6 +249,12 @@ pub async fn start_crawl(
     state: tauri::State<'_, CrawlState>,
     ctx: tauri::State<'_, Arc<AppContext>>,
 ) -> Result<(), String> {
+    if let Err(e) = crate::ssrf::validate_seed_url(&config.seed_url).await {
+        let emitter = TauriEmitter::new(app);
+        let _ = emit_log(&emitter, "error", "system", &format!("SSRF validation rejected seed URL {}: {}", config.seed_url, e)).await;
+        return Err(e);
+    }
+
     {
         let mut handle = state.task_handle.lock();
         if let Some(h) = handle.take() {
@@ -233,9 +285,22 @@ pub async fn start_crawl(
 
     let _ = emit_log(&emitter, "info", "local", &format!("Crawl started: id={}, seed={}", crawl_id, config.seed_url));
 
+    let shared = state.outcomes_arc();
+
     let handle = tokio::spawn(async move {
         let crawler = Crawler::new();
-        let _ = crawler.run(config, emitter, &control, &crawl_id, &ctx_arc, &app_data_dir).await;
+        let result = crawler.run(config, emitter.clone(), &control, &crawl_id, &ctx_arc, &app_data_dir, Some(shared.clone())).await;
+
+        let (pages_archived, cancelled_flag) = match &result {
+            Ok(pages) => (pages.len() as u64, control.is_cancelled()),
+            Err(_) => (0, false),
+        };
+
+        let summary = shared.build_crawl_done_summary(pages_archived, cancelled_flag, &crawl_id);
+
+        let _ = emitter.emit("crawl-done", &serde_json::to_value(&summary).unwrap_or_default()).await;
+
+        let _ = result;
     });
 
     {
@@ -255,6 +320,12 @@ pub async fn start_cloud_crawl(
     state: tauri::State<'_, CrawlState>,
     ctx: tauri::State<'_, Arc<AppContext>>,
 ) -> Result<(), String> {
+    if let Err(e) = crate::ssrf::validate_seed_url(&config.seed_url).await {
+        let emitter = TauriEmitter::new(app);
+        let _ = emit_log(&emitter, "error", "system", &format!("SSRF validation rejected seed URL {}: {}", config.seed_url, e)).await;
+        return Err(e);
+    }
+
     if ctx.zyte.is_none() && api_key.is_empty() {
         return Err("Zyte engine not configured: set ZYTE_API_KEY and CRASP_ZYTE_PROJECT".to_string());
     }
@@ -301,6 +372,8 @@ pub async fn start_cloud_crawl(
 
     let _ = emit_log(&emitter, "info", "cloud", &format!("Cloud crawl started: id={}, seed={}", crawl_id, config.seed_url));
 
+    let shared = state.outcomes_arc();
+
     let handle = tokio::spawn(async move {
         let _control = new_control;
         let client = ZyteClient::new(effective_api_key);
@@ -336,25 +409,17 @@ pub async fn start_cloud_crawl(
         let job_key = match client.run_job(&job_req).await {
             Ok(k) => k,
             Err(e) => {
+                let _ = emit_log(&emitter, "error", "cloud", &format!("Zyte job submit failed: {}", e));
                 let _ = emitter.emit("page-stage", &serde_json::json!({
                     "url": config.seed_url,
                     "crawl_id": crawl_id,
                     "stage": PageStage::Failed { failed_stage: "zyte_submit".to_string(), reason: e.clone() },
                 })).await;
-                let _ = emitter.emit("crawl-done", &serde_json::json!({
-                    "pages_archived": 0,
-                    "cancelled": false,
-                    "error": e,
-                })).await;
+                let summary = shared.build_crawl_done_summary(0, false, &crawl_id);
+                let _ = emitter.emit("crawl-done", &serde_json::to_value(&summary).unwrap_or_default()).await;
                 return;
             }
         };
-
-        // Cloud crawl: the remote job handles Discovered -> Fetching ->
-        // Fetched. After the job finishes we fetch items and persist them.
-        // Intermediate pipeline stages are not observable remotely, so we
-        // emit at coarser granularity: Discovered -> Fetching -> Persisting
-        // -> Persisted (or Failed).
 
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<ZyteProgress>(100);
 
@@ -377,16 +442,14 @@ pub async fn start_cloud_crawl(
 
         if let Err(e) = wait_task.await.unwrap_or(Err("join error".to_string())) {
             let _ = progress_emitter.await;
+            let _ = emit_log(&emitter, "error", "cloud", &format!("Zyte job wait failed: {}", e));
             let _ = emitter.emit("page-stage", &serde_json::json!({
                 "url": config.seed_url,
                 "crawl_id": crawl_id,
                 "stage": PageStage::Failed { failed_stage: "zyte_wait".to_string(), reason: e.clone() },
             })).await;
-            let _ = emitter.emit("crawl-done", &serde_json::json!({
-                "pages_archived": 0,
-                "cancelled": false,
-                "error": e,
-            })).await;
+            let summary = shared.build_crawl_done_summary(0, false, &crawl_id);
+            let _ = emitter.emit("crawl-done", &serde_json::to_value(&summary).unwrap_or_default()).await;
             return;
         }
         let _ = progress_emitter.await;
@@ -409,6 +472,7 @@ pub async fn start_cloud_crawl(
         let ctx_items = ctx_arc.clone();
         let crawl_id_items = crawl_id.clone();
         let app_data_dir_items = app_data_dir.clone();
+        let shared_items = shared.clone();
         let items_emitter = tokio::spawn(async move {
             let mut count = 0u64;
             let mut buffer: Vec<serde_json::Value> = Vec::with_capacity(50);
@@ -435,7 +499,7 @@ pub async fn start_cloud_crawl(
                                         &app_data_dir_items,
                                         &fallback_active,
                                     ).await;
-                                    emit_persist_stages(&emitter_items, &crawl_id_items, outcomes).await;
+                                    emit_persist_stages(&emitter_items, &crawl_id_items, outcomes, Some(&shared_items)).await;
                                 }
                             }
                             None => {
@@ -447,7 +511,7 @@ pub async fn start_cloud_crawl(
                                         &app_data_dir_items,
                                         &fallback_active,
                                     ).await;
-                                    emit_persist_stages(&emitter_items, &crawl_id_items, outcomes).await;
+                                    emit_persist_stages(&emitter_items, &crawl_id_items, outcomes, Some(&shared_items)).await;
                                 }
                                 break;
                             }
@@ -462,7 +526,7 @@ pub async fn start_cloud_crawl(
                                 &app_data_dir_items,
                                 &fallback_active,
                             ).await;
-                            emit_persist_stages(&emitter_items, &crawl_id_items, outcomes).await;
+                            emit_persist_stages(&emitter_items, &crawl_id_items, outcomes, Some(&shared_items)).await;
                         }
                     }
                 }
@@ -473,11 +537,8 @@ pub async fn start_cloud_crawl(
         let _ = fetch_task.await;
         let count = items_emitter.await.unwrap_or(0);
 
-        let _ = emitter.emit("crawl-done", &serde_json::json!({
-            "pages_archived": count,
-            "cancelled": false,
-            "crawl_id": crawl_id,
-        })).await;
+        let summary = shared.build_crawl_done_summary(count, false, &crawl_id);
+        let _ = emitter.emit("crawl-done", &serde_json::to_value(&summary).unwrap_or_default()).await;
     });
 
     {
@@ -492,6 +553,7 @@ pub async fn emit_persist_stages(
     emitter: &TauriEmitter,
     crawl_id: &str,
     outcomes: Vec<(serde_json::Value, PersistOutcome)>,
+    shared: Option<&Arc<SharedCrawlOutcomes>>,
 ) {
     for (item, outcome) in outcomes {
         let url = item
@@ -517,9 +579,30 @@ pub async fn emit_persist_stages(
                         reason: reason.clone(),
                     },
                 })).await;
+                if let Some(s) = shared {
+                    s.pages_failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 continue;
             }
         };
+
+        if let Some(s) = shared {
+            match &outcome {
+                PersistOutcome::Mongo { .. } => {
+                    s.used_mongo.store(true, std::sync::atomic::Ordering::SeqCst);
+                    s.pages_completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                PersistOutcome::LocalFile { path } => {
+                    let mut lp = s.local_file_path.lock();
+                    if lp.is_none() {
+                        *lp = Some(path.clone());
+                    }
+                    drop(lp);
+                    s.pages_completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                PersistOutcome::Failed { .. } => {}
+            }
+        }
 
         let _ = emitter.emit("page-stage", &serde_json::json!({
             "url": url,
@@ -542,6 +625,12 @@ pub async fn local_scrapy_crawl(
     state: tauri::State<'_, CrawlState>,
     ctx: tauri::State<'_, Arc<AppContext>>,
 ) -> Result<(), String> {
+    if let Err(e) = crate::ssrf::validate_seed_url(&config.seed_url).await {
+        let emitter = TauriEmitter::new(app);
+        let _ = emit_log(&emitter, "error", "system", &format!("SSRF validation rejected seed URL {}: {}", config.seed_url, e)).await;
+        return Err(e);
+    }
+
     {
         let mut handle = state.task_handle.lock();
         if let Some(h) = handle.take() {
@@ -572,9 +661,10 @@ pub async fn local_scrapy_crawl(
     let _ = emit_log(&emitter, "info", "local-scrapy", &format!("Local-Scrapy crawl started: id={}, seed={}", crawl_id, config.seed_url));
 
     let out_path = format!("{}/crasp_{}.jl", app_data_dir, chrono::Utc::now().timestamp());
+    let shared = state.outcomes_arc();
 
     let handle = tokio::spawn(async move {
-        crate::local_scrapy::run_local_spider_streaming(
+        let result = crate::local_scrapy::run_local_spider_streaming(
             &config,
             &out_path,
             &emitter,
@@ -582,8 +672,18 @@ pub async fn local_scrapy_crawl(
             &ctx_arc,
             &crawl_id,
             &app_data_dir,
-        )
-        .await
+            Some(shared.clone()),
+        ).await;
+
+        let (pages_archived, cancelled) = match &result {
+            Ok(count) => (*count, control.is_cancelled()),
+            Err(_) => (0, false),
+        };
+
+        let summary = shared.build_crawl_done_summary(pages_archived, cancelled, &crawl_id);
+        let _ = emitter.emit("crawl-done", &serde_json::to_value(&summary).unwrap_or_default()).await;
+
+        let _ = result;
     });
 
     {
@@ -617,8 +717,12 @@ pub fn resume_crawl(state: tauri::State<'_, CrawlState>) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn validate_url(url: String) -> Result<String, String> {
-    crate::ssrf::validate_seed_url(&url).await?;
-    Ok(url)
+    match crate::ssrf::validate_seed_url(&url).await {
+        Ok(parsed) => Ok(parsed.to_string()),
+        Err(e) => {
+            Err(format!("SSRF validation rejected: {}", e))
+        }
+    }
 }
 
 #[tauri::command]
@@ -715,13 +819,236 @@ pub struct PageSummary {
     pub status_reason: Option<String>,
     pub content_size: usize,
     pub timestamp: String,
+    pub source: StorageSource,
+    pub content_preview: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum StorageSource {
+    Mongo,
+    LocalFile { path: String },
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LocalCrawlSummary {
+    pub crawl_id: String,
+    pub page_count: u64,
+    pub file_size_bytes: u64,
+    pub last_modified: String,
+    pub file_path: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub enum StorageUsed {
+    Mongo,
+    LocalFile { path: String },
+    Both { local_path: String },
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CrawlDoneSummary {
+    pub pages_archived: u64,
+    pub pages_completed: u64,
+    pub pages_failed: u64,
+    pub pages_skipped: u64,
+    pub cancelled: bool,
+    pub crawl_id: String,
+    pub storage_used: Option<StorageUsed>,
+}
+
+pub fn parse_jl_pages(
+    path: &PathBuf,
+    crawl_id_filter: Option<&str>,
+) -> Result<Vec<PageSummary>, String> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("Failed to open JL file {:?}: {}", path, e))?;
+    let reader = std::io::BufReader::new(file);
+    let mut pages = Vec::new();
+
+    for line_result in std::io::BufRead::lines(reader) {
+        let line = line_result.map_err(|e| format!("Read error: {}", e))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let item: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if let Some(filter) = crawl_id_filter {
+            let item_cid = item
+                .get("crawl_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if item_cid != filter {
+                continue;
+            }
+        }
+
+        let url = item
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let title = item
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let depth = item
+            .get("depth")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+
+        let (status, status_reason) = match item.get("status") {
+            Some(serde_json::Value::String(s)) => (s.clone(), None),
+            Some(serde_json::Value::Object(map)) => {
+                if let Some(v) = map.get("Failed").and_then(|v| v.as_str()) {
+                    ("Failed".to_string(), Some(v.to_string()))
+                } else if let Some(v) = map.get("Skipped").and_then(|v| v.as_str()) {
+                    ("Skipped".to_string(), Some(v.to_string()))
+                } else {
+                    ("Unknown".to_string(), None)
+                }
+            }
+            _ => {
+                let code = item
+                    .get("status_code")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as i32;
+                if (200..300).contains(&code) {
+                    ("Completed".to_string(), None)
+                } else {
+                    ("Failed".to_string(), Some(format!("HTTP {}", code)))
+                }
+            }
+        };
+
+        let content = item
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let content_size = content.len();
+        let content_preview = if content_size > 0 {
+            Some(content.chars().take(500).collect())
+        } else {
+            None
+        };
+        let timestamp = item
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        pages.push(PageSummary {
+            url,
+            title,
+            depth,
+            stage: status,
+            status_reason,
+            content_size,
+            timestamp: if timestamp.is_empty() {
+                chrono::Utc::now().to_rfc3339()
+            } else {
+                timestamp
+            },
+            source: StorageSource::LocalFile {
+                path: path.to_string_lossy().to_string(),
+            },
+            content_preview,
+        });
+    }
+
+    Ok(pages)
+}
+
+#[tauri::command]
+pub async fn list_local_crawls(
+    app: AppHandle,
+) -> Result<Vec<LocalCrawlSummary>, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+
+    let dir = PathBuf::from(&app_data_dir);
+    let entries = tokio::task::spawn_blocking(move || {
+        let mut crawls = Vec::new();
+        let read_dir = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => return crawls,
+        };
+
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let filename = match path.file_name() {
+                Some(n) => n.to_string_lossy().to_string(),
+                None => continue,
+            };
+            if !filename.starts_with("crawl-") || !filename.ends_with(".jl") {
+                continue;
+            }
+
+            let crawl_id = filename
+                .strip_prefix("crawl-")
+                .unwrap_or("")
+                .strip_suffix(".jl")
+                .unwrap_or("")
+                .to_string();
+
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|t| {
+                    let dur = t.duration_since(std::time::UNIX_EPOCH).ok()?;
+                    Some(chrono::DateTime::from_timestamp(dur.as_secs() as i64, 0)?
+                        .to_rfc3339())
+                })
+                .unwrap_or_default();
+
+            let page_count = {
+                let p = path.clone();
+                std::io::BufReader::new(
+                    std::fs::File::open(&p).unwrap()
+                )
+                .lines()
+                .filter(|l| l.as_ref().map_or(false, |s| !s.trim().is_empty()))
+                .count() as u64
+            };
+
+            crawls.push(LocalCrawlSummary {
+                crawl_id,
+                page_count,
+                file_size_bytes: metadata.len(),
+                last_modified: modified,
+                file_path: path.to_string_lossy().to_string(),
+            });
+        }
+
+        crawls
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking panic: {}", e))?;
+
+    Ok(entries)
 }
 
 #[tauri::command]
 pub async fn list_archived_pages(
     crawl_id: Option<String>,
     ctx: tauri::State<'_, Arc<AppContext>>,
+    app: AppHandle,
 ) -> Result<Vec<PageSummary>, String> {
+    let mut mongo_pages = Vec::new();
+
     if let Some(store) = &ctx.store {
         let mut filter = mongodb::bson::Document::new();
         if let Some(cid) = &crawl_id {
@@ -734,13 +1061,17 @@ pub async fn list_archived_pages(
             .await
             .map_err(|e| format!("Mongo query failed: {}", e))?;
 
-        let mut summaries = Vec::new();
         while let Some(doc) = cursor
             .try_next()
             .await
             .map_err(|e| format!("Cursor error: {}", e))?
         {
-            summaries.push(PageSummary {
+            let content_preview = if doc.content.len() > 0 {
+                Some(doc.content.chars().take(500).collect())
+            } else {
+                None
+            };
+            mongo_pages.push(PageSummary {
                 url: doc.url.clone(),
                 title: doc.title.clone(),
                 depth: doc.depth,
@@ -748,22 +1079,157 @@ pub async fn list_archived_pages(
                 status_reason: doc.status_reason.clone(),
                 content_size: doc.content.len(),
                 timestamp: doc.timestamp.clone(),
+                source: StorageSource::Mongo,
+                content_preview,
             });
         }
+    }
 
-        Ok(summaries)
-    } else {
-        Ok(Vec::new())
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+
+    let crawl_id_clone = crawl_id.clone();
+    let local_pages = tokio::task::spawn_blocking(move || {
+        let dir = PathBuf::from(&app_data_dir);
+        let read_dir = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => return Vec::<PageSummary>::new(),
+        };
+
+        let mut all_local = Vec::new();
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let filename = match path.file_name() {
+                Some(n) => n.to_string_lossy().to_string(),
+                None => continue,
+            };
+            if !filename.starts_with("crawl-") || !filename.ends_with(".jl") {
+                continue;
+            }
+
+            if let Some(ref cid) = crawl_id_clone {
+                let file_cid = filename
+                    .strip_prefix("crawl-")
+                    .unwrap_or("")
+                    .strip_suffix(".jl")
+                    .unwrap_or("");
+                if file_cid != cid {
+                    continue;
+                }
+            }
+
+            if let Ok(pages) = parse_jl_pages(&path, None) {
+                all_local.extend(pages);
+            }
+        }
+        all_local
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking panic: {}", e))?;
+
+    let mut seen_urls = std::collections::HashSet::new();
+    for p in &mongo_pages {
+        seen_urls.insert(p.url.clone());
+    }
+    let local_only: Vec<PageSummary> = local_pages
+        .into_iter()
+        .filter(|p| !seen_urls.contains(&p.url))
+        .collect();
+
+    let mut all_pages = mongo_pages;
+    all_pages.extend(local_only);
+    Ok(all_pages)
+}
+
+#[tauri::command]
+pub async fn get_page_content(
+    url: String,
+    source: StorageSource,
+    crawl_id: Option<String>,
+    ctx: tauri::State<'_, Arc<AppContext>>,
+) -> Result<Option<String>, String> {
+    match source {
+        StorageSource::Mongo => {
+            if let Some(store) = &ctx.store {
+                let mut filter = mongodb::bson::doc! { "url": &url };
+                if let Some(cid) = &crawl_id {
+                    filter.insert("crawl_id", cid);
+                }
+                let doc = store
+                    .pages_col()
+                    .find_one(filter)
+                    .await
+                    .map_err(|e| format!("Mongo query failed: {}", e))?;
+                Ok(doc.map(|d| d.content.clone()))
+            } else {
+                Ok(None)
+            }
+        }
+        StorageSource::LocalFile { path } => {
+            let url_clone = url.clone();
+            let crawl_id_clone = crawl_id.clone();
+            let content = tokio::task::spawn_blocking(move || {
+                let file = std::fs::File::open(&path)
+                    .map_err(|e| format!("Failed to open JL file: {}", e))?;
+                let reader = std::io::BufReader::new(file);
+                for line_result in std::io::BufRead::lines(reader) {
+                    let line = line_result.map_err(|e| format!("Read error: {}", e))?;
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let item: serde_json::Value = match serde_json::from_str(trimmed) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let item_url = item
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if item_url == url_clone {
+                        if let Some(cid) = &crawl_id_clone {
+                            let item_cid = item
+                                .get("crawl_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if item_cid != cid {
+                                continue;
+                            }
+                        }
+                        return Ok(item
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .map(String::from));
+                    }
+                }
+                Ok(None)
+            })
+            .await
+            .map_err(|e| format!("spawn_blocking panic: {}", e))?
+            .map_err(|e: String| e)?;
+            Ok(content)
+        }
     }
 }
 
 #[tauri::command]
 pub async fn export_page(
-    crawl_id: String,
     url: String,
+    source: StorageSource,
+    crawl_id: Option<String>,
     format: String,
     ctx: tauri::State<'_, Arc<AppContext>>,
 ) -> Result<String, String> {
+    let content = get_page_content(url.clone(), source, crawl_id, ctx).await?;
+
+    let content = match content {
+        Some(c) if !c.is_empty() => c,
+        _ => return Err("Page has no content or was not found".to_string()),
+    };
+
     let slug: String = url
         .split('/')
         .filter(|s| !s.is_empty() && *s != "http:" && *s != "https:")
@@ -772,31 +1238,6 @@ pub async fn export_page(
         .chars()
         .take(30)
         .collect();
-
-    let content = if let Some(store) = &ctx.store {
-        let filter = mongodb::bson::doc! {
-            "crawl_id": crawl_id,
-            "url": url,
-        };
-        let doc = store
-            .pages_col()
-            .find_one(filter)
-            .await
-            .map_err(|e| format!("Mongo query failed: {}", e))?;
-
-        match doc {
-            Some(page) => page.content.clone(),
-            None => return Err("Page not found in store".to_string()),
-        }
-    } else {
-        return Err("No database connected, cannot look up page".to_string());
-    };
-
-    let content = if content.is_empty() {
-        return Err("Page has no content".to_string());
-    } else {
-        content
-    };
 
     let ext = if format == "md" { "md" } else { "txt" };
     let ts = chrono::Utc::now().timestamp_millis();
@@ -812,4 +1253,39 @@ pub async fn export_page(
         .map_err(|e| format!("Failed to write file: {}", e))?;
 
     Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub async fn open_data_folder(
+    app: AppHandle,
+) -> Result<(), String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+
+    std::fs::create_dir_all(&app_data_dir)
+        .map_err(|e| format!("Failed to create app data dir: {}", e))?;
+
+    tauri_plugin_opener::open_path(&app_data_dir, None::<&str>)
+        .map_err(|e| format!("Failed to open data folder: {}", e))
+}
+
+#[tauri::command]
+pub fn get_last_crawl_summary(
+    state: tauri::State<'_, CrawlState>,
+) -> Result<Option<CrawlDoneSummary>, String> {
+    let crawl_id = state.crawl_id.lock().clone();
+    let Some(cid) = crawl_id else { return Ok(None) };
+    let completed = state.outcomes.pages_completed.load(std::sync::atomic::Ordering::SeqCst);
+    let failed = state.outcomes.pages_failed.load(std::sync::atomic::Ordering::SeqCst);
+    let skipped = state.outcomes.pages_skipped.load(std::sync::atomic::Ordering::SeqCst);
+    if completed == 0 && failed == 0 && skipped == 0 {
+        return Ok(None);
+    }
+    Ok(Some(state.outcomes.build_crawl_done_summary(
+        completed + failed + skipped,
+        false,
+        &cid,
+    )))
 }

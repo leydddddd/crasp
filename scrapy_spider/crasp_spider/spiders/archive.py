@@ -134,6 +134,8 @@ class ArchiveSpider(scrapy.Spider):
         content_hash = compute_hash(content, self.hash_algorithm)
         content_format = "html" if self.preserve_html else "text"
 
+        # Only count pages that are actually yielded as items,
+        # not speculative link scheduling.
         self.pages_archived += 1
 
         yield {
@@ -155,6 +157,7 @@ class ArchiveSpider(scrapy.Spider):
             return
 
         for link in links:
+            # Stop scheduling if we've already archived enough pages.
             if self.pages_archived >= self.max_pages:
                 break
             parsed = urlparse(link)
@@ -166,7 +169,8 @@ class ArchiveSpider(scrapy.Spider):
             if normalized in self.visited:
                 continue
             self.visited.add(normalized)
-            self.pages_archived += 1
+            # Do NOT increment pages_archived here — it counts
+            # only actual yields, not speculative link scheduling.
             yield scrapy.Request(
                 link,
                 callback=self.parse,
@@ -176,6 +180,23 @@ class ArchiveSpider(scrapy.Spider):
 
     def errback(self, failure):
         self.logger.info(f"Request failed: {failure.request.url}")
+        # Yield a minimal Failed item so hard failures are recorded
+        # in the archive instead of silently vanishing.
+        depth = failure.request.meta.get("depth", 0) if failure.request else 0
+        reason = str(failure.value) if failure.value else "Unknown failure"
+        yield {
+            "url": failure.request.url if failure.request else "",
+            "depth": depth,
+            "title": "",
+            "content": "",
+            "content_format": "",
+            "hash": None,
+            "hash_algorithm": self.hash_algorithm,
+            "discovered_links": 0,
+            "status_code": 0,
+            "status": {"Failed": reason},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
 
     def _extract_content(self, response, selectors, preserve_html):
         for sel_str in selectors:

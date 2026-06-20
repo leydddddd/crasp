@@ -57,19 +57,22 @@ impl ServiceState {
 
 impl AppContext {
     pub async fn from_env() -> Result<Self, String> {
-        let mongo_uri = env::var("CRASP_MONGO_URI")
-            .unwrap_or_else(|_| "mongodb://localhost:27017".to_string());
+        let mongo_uri_opt = env::var("CRASP_MONGO_URI").ok().filter(|s| !s.is_empty());
 
-        let (store, mongo_initial) = match ArchiveStore::from_uri(&mongo_uri).await {
-            Ok(s) => {
-                if let Err(e) = s.ensure_indexes().await {
-                    eprintln!("Warning: index creation failed: {}", e);
+        let (store, mongo_initial) = if let Some(mongo_uri) = mongo_uri_opt {
+            match ArchiveStore::from_uri(&mongo_uri).await {
+                Ok(s) => {
+                    if let Err(e) = s.ensure_indexes().await {
+                        eprintln!("Warning: index creation failed: {}", e);
+                    }
+                    (Some(Arc::new(s)), ServiceState::ConfiguredUnverified)
                 }
-                (Some(Arc::new(s)), ServiceState::ConfiguredUnverified)
+                Err(_) => {
+                    (None, ServiceState::NotConfigured)
+                }
             }
-            Err(_) => {
-                (None, ServiceState::NotConfigured)
-            }
+        } else {
+            (None, ServiceState::NotConfigured)
         };
 
         let zyte = env::var("ZYTE_API_KEY").ok().and_then(|api_key| {

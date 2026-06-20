@@ -15,7 +15,7 @@ use url::Url;
 use phf::phf_set;
 
 use crate::commands::TauriEmitter;
-use crate::commands::{persist_items_with_outcome, emit_persist_stages};
+use crate::commands::{persist_items_with_outcome, emit_persist_stages, SharedCrawlOutcomes};
 use crate::logging::emit_log;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +93,7 @@ pub struct ArchivedPage {
     pub hash_algorithm: Option<String>,
     pub discovered_links: u32,
     pub timestamp: String,
+    pub crawl_id: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -214,6 +215,7 @@ impl Crawler {
         crawl_id: &str,
         ctx: &Arc<crate::runtime::AppContext>,
         app_data_dir: &str,
+        shared_outcomes: Option<Arc<SharedCrawlOutcomes>>,
     ) -> Result<Vec<ArchivedPage>, String> {
         let seed = Url::parse(&config.seed_url).map_err(|e| e.to_string())?;
         let domain = seed.domain().ok_or("seed URL has no domain")?.to_string();
@@ -463,7 +465,7 @@ impl Crawler {
                                     &app_data_dir_owned,
                                     &fallback_active,
                                 ).await;
-                                emit_persist_stages(&emitter_result, &crawl_id_owned, outcomes).await;
+                                emit_persist_stages(&emitter_result, &crawl_id_owned, outcomes, shared_outcomes.as_ref()).await;
                             }
                         }
                         None => break,
@@ -491,7 +493,7 @@ impl Crawler {
                 &app_data_dir_owned,
                 &fallback_active,
             ).await;
-            emit_persist_stages(&emitter_result, &crawl_id_owned, outcomes).await;
+            emit_persist_stages(&emitter_result, &crawl_id_owned, outcomes, shared_outcomes.as_ref()).await;
         }
 
         cancelled_flag.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -502,11 +504,12 @@ impl Crawler {
         let _ = worker_loop.await;
         let _ = collector.await;
 
-        let _ = emitter.emit("crawl-done", &serde_json::json!({
-            "pages_archived": results.len(),
-            "cancelled": cancelled.load(std::sync::atomic::Ordering::SeqCst),
-            "crawl_id": crawl_id,
-        })).await;
+        let cancelled_flag_val = cancelled.load(std::sync::atomic::Ordering::SeqCst);
+        if cancelled_flag_val {
+            let _ = emit_log(&emitter, "warn", "local", &format!("Crawl cancelled: id={}", crawl_id));
+        } else {
+            let _ = emit_log(&emitter, "info", "local", &format!("Crawl completed: id={}, pages={}", crawl_id, results.len()));
+        }
 
         Ok(results)
     }
@@ -532,6 +535,7 @@ async fn process_page(
         hash_algorithm: None,
         discovered_links: 0,
         timestamp: Utc::now().to_rfc3339(),
+        crawl_id: Some(crawl_id.to_string()),
     };
 
     let _ = emitter.emit("scrape-progress", &serde_json::json!({

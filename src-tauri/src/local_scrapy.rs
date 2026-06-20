@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-use crate::commands::{persist_items_with_outcome, emit_persist_stages, TauriEmitter};
+use crate::commands::{persist_items_with_outcome, emit_persist_stages, TauriEmitter, SharedCrawlOutcomes};
 use crate::crawler::{CrawlConfig, CrawlControl, PageStage};
 use crate::runtime::AppContext;
 
@@ -42,10 +42,8 @@ pub async fn run_local_spider_streaming(
     ctx: &Arc<AppContext>,
     crawl_id: &str,
     app_data_dir: &str,
+    shared: Option<Arc<SharedCrawlOutcomes>>,
 ) -> Result<u64, String> {
-    // Local-Scrapy pipeline stages are coarser — we emit Discovered,
-    // Fetching (representing the remote job), then after items are
-    // fetched and persisted, Persisting -> Persisted (or Failed).
     let _ = emitter.emit("page-stage", &serde_json::json!({
         "url": config.seed_url,
         "crawl_id": crawl_id,
@@ -135,11 +133,6 @@ pub async fn run_local_spider_streaming(
                 let _ = child.wait().await;
 
                 let _ = stderr_task.abort();
-                let _ = emitter.emit("crawl-done", &serde_json::json!({
-                    "pages_archived": 0,
-                    "cancelled": true,
-                    "crawl_id": crawl_id,
-                })).await;
 
                 return Ok(0);
             }
@@ -202,13 +195,7 @@ pub async fn run_local_spider_streaming(
         &fallback_active,
     )
     .await;
-    emit_persist_stages(&emitter_ingest, &crawl_id_ingest, outcomes).await;
-
-    let _ = emitter.emit("crawl-done", &serde_json::json!({
-        "pages_archived": count,
-        "cancelled": false,
-        "crawl_id": crawl_id,
-    })).await;
+    emit_persist_stages(&emitter_ingest, &crawl_id_ingest, outcomes, shared.as_ref()).await;
 
     Ok(count)
 }

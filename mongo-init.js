@@ -1,7 +1,7 @@
 db = db.getSiblingDB("crasp");
 
 db.pages.createIndex({ crawl_id: 1, depth: 1 });
-db.pages.createIndex({ url_normalized: 1 }, { unique: true });
+db.pages.createIndex({ crawl_id: 1, url_normalized: 1 }, { unique: true });
 db.pages.createIndex({ crawl_id: 1, status: 1 });
 db.pages.createIndex({ duplicate_group_id: 1 });
 db.pages.createIndex({ timestamp: -1 });

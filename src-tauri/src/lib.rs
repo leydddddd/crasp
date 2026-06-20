@@ -1,10 +1,10 @@
-mod commands;
-mod crawler;
+pub mod commands;
+pub mod crawler;
 mod local_scrapy;
 mod logging;
-mod runtime;
+pub mod runtime;
 mod schema;
-mod ssrf;
+pub mod ssrf;
 mod store;
 mod zyte;
 
@@ -33,7 +33,11 @@ pub fn run() {
             commands::test_mongo_connection,
             commands::test_zyte_connection,
             commands::list_archived_pages,
+            commands::list_local_crawls,
+            commands::get_page_content,
             commands::export_page,
+            commands::open_data_folder,
+            commands::get_last_crawl_summary,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
