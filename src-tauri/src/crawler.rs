@@ -94,6 +94,17 @@ pub struct ArchivedPage {
     pub discovered_links: u32,
     pub timestamp: String,
     pub crawl_id: Option<String>,
+    pub extracted_title: Option<String>,
+    pub author: Option<String>,
+    pub published_date: Option<String>,
+    pub excerpt: Option<String>,
+    pub reading_time_minutes: Option<u32>,
+    pub body_text: Option<String>,
+    pub body_html: Option<String>,
+    pub assets: Option<crate::schema::PageAssets>,
+    pub extraction_method: Option<String>,
+    pub extraction_confidence: Option<f32>,
+    pub thin_content: Option<bool>,
 }
 
 #[allow(dead_code)]
@@ -536,6 +547,17 @@ async fn process_page(
         discovered_links: 0,
         timestamp: Utc::now().to_rfc3339(),
         crawl_id: Some(crawl_id.to_string()),
+        extracted_title: None,
+        author: None,
+        published_date: None,
+        excerpt: None,
+        reading_time_minutes: None,
+        body_text: None,
+        body_html: None,
+        assets: None,
+        extraction_method: None,
+        extraction_confidence: None,
+        thin_content: None,
     };
 
     let _ = emitter.emit("scrape-progress", &serde_json::json!({
@@ -641,21 +663,33 @@ async fn process_page(
         "stage": PageStage::Parsing,
     })).await;
 
-    let (title, links, extracted) = {
+    let (title, links, extracted, extraction_result) = {
         let html_text = html_text.clone();
         let url_for_links = url_str.clone();
-        let css_selectors = config.css_selectors.clone();
         let preserve_html = config.preserve_html;
+        let base_url = url_str.clone();
 
         tokio::task::spawn_blocking(move || {
             let document = Html::parse_document(&html_text);
             let title = extract_title(&document);
             let links = extract_links(&document, &url_for_links);
-            let extracted = extract_and_sanitize(&document, &css_selectors, preserve_html);
-            (title, links, extracted)
+
+            let extraction = crate::extraction::extract_main_content(&html_text, &base_url);
+            let assets = crate::extraction::extract_assets(&html_text, &base_url, &extraction.body_html);
+
+            let extracted = if preserve_html {
+                extraction.body_html.clone()
+            } else {
+                extraction.body_text.clone()
+            };
+
+            (title, links, extracted, (extraction, assets))
         })
         .await
-        .unwrap_or_else(|_| (String::new(), vec![], String::new()))
+        .unwrap_or_else(|_| (String::new(), vec![], String::new(), {
+            let er = crate::extraction::ExtractionResult::raw_fallback();
+            (er, crate::schema::PageAssets::default())
+        }))
     };
 
     let stage = if config.preserve_html { PageStage::Sanitizing } else { PageStage::Preserving };
@@ -671,6 +705,45 @@ async fn process_page(
         page.title = title;
     }
     page.discovered_links = links.len() as u32;
+
+    let (mut extraction, assets) = extraction_result;
+    page.extracted_title = extraction.title.take();
+    page.author = extraction.author.take();
+    page.published_date = extraction.published_date.take();
+    page.excerpt = extraction.excerpt.take();
+    page.reading_time_minutes = if extraction.reading_time_minutes > 0 {
+        Some(extraction.reading_time_minutes)
+    } else {
+        None
+    };
+    page.body_text = if !extraction.body_text.is_empty() {
+        Some(std::mem::take(&mut extraction.body_text))
+    } else {
+        None
+    };
+    page.body_html = if !extraction.body_html.is_empty() {
+        Some(std::mem::take(&mut extraction.body_html))
+    } else {
+        None
+    };
+    page.assets = Some(assets);
+    page.extraction_method = Some(extraction.extraction_method().to_string());
+    page.extraction_confidence = Some(extraction.confidence);
+    let is_thin = extraction.thin_content;
+    page.thin_content = Some(is_thin);
+    let non_ws_count = if is_thin {
+        extraction.body_text.chars().filter(|c| !c.is_whitespace()).count()
+    } else {
+        0
+    };
+
+    if is_thin {
+        let _ = emit_log(emitter, "warn", "local", &format!(
+            "Thin content detected on {} ({} chars) — may require JS rendering",
+            url_str,
+            non_ws_count
+        ));
+    }
 
     let _ = emitter.emit("crawl-discover", &serde_json::json!({
         "url": url_str,
@@ -747,25 +820,7 @@ fn extract_links(document: &Html, base_url: &str) -> Vec<String> {
         .collect()
 }
 
-fn extract_and_sanitize(
-    document: &Html,
-    selectors: &[String],
-    preserve_html: bool,
-) -> String {
-    let matched = select_content(document, selectors);
-
-    if matched.is_empty() {
-        return String::new();
-    }
-
-    if preserve_html {
-        sanitize_to_html(&matched)
-    } else {
-        sanitize_to_text(&matched)
-    }
-}
-
-fn select_content<'a>(document: &'a Html, selectors: &[String]) -> Vec<scraper::ElementRef<'a>> {
+pub fn select_content<'a>(document: &'a Html, selectors: &[String]) -> Vec<scraper::ElementRef<'a>> {
     for sel_str in selectors {
         if let Ok(selector) = Selector::parse(sel_str) {
             let els: Vec<_> = document.select(&selector).collect();
@@ -833,7 +888,7 @@ impl TagSets {
     }
 }
 
-fn sanitize_to_html(elements: &[scraper::ElementRef]) -> String {
+pub fn sanitize_to_html(elements: &[scraper::ElementRef]) -> String {
     let sets = TagSets::global();
     let mut output = String::with_capacity(8192);
 
@@ -892,7 +947,7 @@ fn render_node_html_into(node_ref: &NodeRef<Node>, sets: &TagSets, out: &mut Str
     }
 }
 
-fn sanitize_to_text(elements: &[scraper::ElementRef]) -> String {
+pub fn sanitize_to_text(elements: &[scraper::ElementRef]) -> String {
     let sets = TagSets::global();
     let mut parts = Vec::new();
 

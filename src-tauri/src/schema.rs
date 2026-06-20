@@ -48,6 +48,53 @@ pub struct PageDoc {
     pub timestamp: String,
     pub duplicate_group_id: i32,
     pub search_blob: String,
+    pub extracted_title: Option<String>,
+    pub author: Option<String>,
+    pub published_date: Option<String>,
+    pub excerpt: Option<String>,
+    pub reading_time_minutes: Option<u32>,
+    pub body_text: Option<String>,
+    pub body_html: Option<String>,
+    pub assets: Option<PageAssets>,
+    pub extraction_method: Option<String>,
+    pub extraction_confidence: Option<f32>,
+    pub thin_content: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PageAssets {
+    pub images: Vec<AssetImage>,
+    pub videos: Vec<AssetVideo>,
+    pub documents: Vec<AssetDocument>,
+    pub og_image: Option<String>,
+    pub og_description: Option<String>,
+    pub og_published_time: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetImage {
+    pub src: String,
+    pub alt: Option<String>,
+    pub caption: Option<String>,
+    pub in_main_content: bool,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetVideo {
+    pub src: String,
+    pub kind: String,
+    pub video_id: Option<String>,
+    pub in_main_content: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetDocument {
+    pub src: String,
+    pub link_text: Option<String>,
+    pub mime_type: Option<String>,
+    pub in_main_content: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

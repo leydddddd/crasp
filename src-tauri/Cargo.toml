@@ -14,7 +14,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["gzip", "brotli", "deflate", "json"] }
+reqwest = { version = "0.12", features = ["gzip", "brotli", "deflate", "json", "blocking"] }
 scraper = "0.22"
 sha2 = "0.10"
 md-5 = "0.10"
@@ -32,6 +32,9 @@ mongodb = { version = "3", features = ["compat-3-3-0"] }
 bson = "2"
 dirs = "6"
 futures-util = "0.3"
+readability = { version = "0.3", default-features = false }
+epub-builder = "0.7"
+mime_guess = "2"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(mobile)"] }

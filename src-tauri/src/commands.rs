@@ -821,6 +821,17 @@ pub struct PageSummary {
     pub timestamp: String,
     pub source: StorageSource,
     pub content_preview: Option<String>,
+    pub extracted_title: Option<String>,
+    pub author: Option<String>,
+    pub published_date: Option<String>,
+    pub excerpt: Option<String>,
+    pub reading_time_minutes: Option<u32>,
+    pub body_text: Option<String>,
+    pub body_html: Option<String>,
+    pub assets: Option<crate::schema::PageAssets>,
+    pub extraction_method: Option<String>,
+    pub extraction_confidence: Option<f32>,
+    pub thin_content: Option<bool>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -942,6 +953,49 @@ pub fn parse_jl_pages(
             .unwrap_or("")
             .to_string();
 
+        let extracted_title = item
+            .get("extracted_title")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let author = item
+            .get("author")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let published_date = item
+            .get("published_date")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let excerpt_val = item
+            .get("excerpt")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let reading_time_minutes = item
+            .get("reading_time_minutes")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let body_text = item
+            .get("body_text")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let body_html = item
+            .get("body_html")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let assets: Option<crate::schema::PageAssets> = item
+            .get("assets")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let extraction_method = item
+            .get("extraction_method")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let extraction_confidence = item
+            .get("extraction_confidence")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32);
+        let thin_content = item
+            .get("thin_content")
+            .and_then(|v| v.as_bool());
+
         pages.push(PageSummary {
             url,
             title,
@@ -958,6 +1012,17 @@ pub fn parse_jl_pages(
                 path: path.to_string_lossy().to_string(),
             },
             content_preview,
+            extracted_title,
+            author,
+            published_date,
+            excerpt: excerpt_val,
+            reading_time_minutes,
+            body_text,
+            body_html,
+            assets,
+            extraction_method,
+            extraction_confidence,
+            thin_content,
         });
     }
 
@@ -1081,6 +1146,17 @@ pub async fn list_archived_pages(
                 timestamp: doc.timestamp.clone(),
                 source: StorageSource::Mongo,
                 content_preview,
+                extracted_title: doc.extracted_title.clone(),
+                author: doc.author.clone(),
+                published_date: doc.published_date.clone(),
+                excerpt: doc.excerpt.clone(),
+                reading_time_minutes: doc.reading_time_minutes,
+                body_text: doc.body_text.clone(),
+                body_html: doc.body_html.clone(),
+                assets: doc.assets.clone(),
+                extraction_method: doc.extraction_method.clone(),
+                extraction_confidence: doc.extraction_confidence,
+                thin_content: doc.thin_content,
             });
         }
     }
@@ -1151,6 +1227,16 @@ pub async fn get_page_content(
     crawl_id: Option<String>,
     ctx: tauri::State<'_, Arc<AppContext>>,
 ) -> Result<Option<String>, String> {
+    let doc = get_page_doc(url, source, crawl_id, ctx).await?;
+    Ok(doc.map(|d| d.content.clone()))
+}
+
+async fn get_page_doc(
+    url: String,
+    source: StorageSource,
+    crawl_id: Option<String>,
+    ctx: tauri::State<'_, Arc<AppContext>>,
+) -> Result<Option<crate::schema::PageDoc>, String> {
     match source {
         StorageSource::Mongo => {
             if let Some(store) = &ctx.store {
@@ -1163,7 +1249,7 @@ pub async fn get_page_content(
                     .find_one(filter)
                     .await
                     .map_err(|e| format!("Mongo query failed: {}", e))?;
-                Ok(doc.map(|d| d.content.clone()))
+                Ok(doc)
             } else {
                 Ok(None)
             }
@@ -1171,7 +1257,7 @@ pub async fn get_page_content(
         StorageSource::LocalFile { path } => {
             let url_clone = url.clone();
             let crawl_id_clone = crawl_id.clone();
-            let content = tokio::task::spawn_blocking(move || {
+            let doc = tokio::task::spawn_blocking(move || {
                 let file = std::fs::File::open(&path)
                     .map_err(|e| format!("Failed to open JL file: {}", e))?;
                 let reader = std::io::BufReader::new(file);
@@ -1199,10 +1285,98 @@ pub async fn get_page_content(
                                 continue;
                             }
                         }
-                        return Ok(item
-                            .get("content")
-                            .and_then(|v| v.as_str())
-                            .map(String::from));
+                        let page_doc = crate::schema::PageDoc {
+                            crawl_id: item
+                                .get("crawl_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            url: item_url.to_string(),
+                            url_normalized: item_url.to_lowercase(),
+                            depth: item
+                                .get("depth")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0) as u32,
+                            title: item
+                                .get("title")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            status: item
+                                .get("status")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Completed")
+                                .to_string(),
+                            status_code: item
+                                .get("status_code")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0) as i32,
+                            status_reason: item
+                                .get("status_reason")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                            content: item
+                                .get("content")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            content_format: "text".to_string(),
+                            content_bytes: None,
+                            discovered_links: item
+                                .get("discovered_links")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0) as u32,
+                            timestamp: item
+                                .get("timestamp")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            duplicate_group_id: 0,
+                            search_blob: String::new(),
+                            extracted_title: item
+                                .get("extracted_title")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                            author: item
+                                .get("author")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                            published_date: item
+                                .get("published_date")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                            excerpt: item
+                                .get("excerpt")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                            reading_time_minutes: item
+                                .get("reading_time_minutes")
+                                .and_then(|v| v.as_u64())
+                                .map(|v| v as u32),
+                            body_text: item
+                                .get("body_text")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                            body_html: item
+                                .get("body_html")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                            assets: item
+                                .get("assets")
+                                .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                            extraction_method: item
+                                .get("extraction_method")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                            extraction_confidence: item
+                                .get("extraction_confidence")
+                                .and_then(|v| v.as_f64())
+                                .map(|v| v as f32),
+                            thin_content: item
+                                .get("thin_content")
+                                .and_then(|v| v.as_bool()),
+                        };
+                        return Ok(Some(page_doc));
                     }
                 }
                 Ok(None)
@@ -1210,49 +1384,336 @@ pub async fn get_page_content(
             .await
             .map_err(|e| format!("spawn_blocking panic: {}", e))?
             .map_err(|e: String| e)?;
-            Ok(content)
+            Ok(doc)
+        }
+    }
+}
+
+
+
+#[tauri::command]
+pub async fn export_content(
+    request: crate::export::ExportRequest,
+    app: AppHandle,
+    ctx: tauri::State<'_, Arc<AppContext>>,
+) -> Result<crate::export::ExportResult, String> {
+    use std::io::Write;
+
+    request.is_valid()?;
+
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+
+    let exports_dir = std::path::PathBuf::from(&app_data_dir).join("exports");
+    std::fs::create_dir_all(&exports_dir)
+        .map_err(|e| format!("Failed to create exports dir: {}", e))?;
+
+    match request.scope {
+        crate::export::ExportScope::SinglePage => {
+            let page_url = request.page_url.as_ref().unwrap();
+            let source = request.source.as_ref().unwrap_or(&StorageSource::Mongo).clone();
+            let page_doc = get_page_doc(page_url.clone(), source, request.crawl_id.clone(), ctx).await?;
+            let page_doc = page_doc.ok_or("Page not found".to_string())?;
+
+            let (ext, content) = match request.format {
+                crate::export::ExportFormat::PlainText => (
+                    "txt",
+                    crate::export::page_to_plain_text(&page_doc, &request.content),
+                ),
+                crate::export::ExportFormat::Markdown => (
+                    "md",
+                    crate::export::page_to_markdown(&page_doc, &request.content),
+                ),
+                crate::export::ExportFormat::Html => (
+                    "html",
+                    crate::export::page_to_html(&page_doc, &request.content),
+                ),
+                crate::export::ExportFormat::Epub => {
+                    return Err("EPUB is not supported for single page export".to_string());
+                }
+            };
+
+            let slug: String = page_url
+                .split('/')
+                .filter(|s| !s.is_empty() && *s != "http:" && *s != "https:")
+                .last()
+                .unwrap_or("page")
+                .chars()
+                .take(30)
+                .collect();
+            let ts = chrono::Utc::now().timestamp_millis();
+            let filename = format!("{}_{}.{}_{}_{}", slug, ts, ext, request.format_string(), request.scope_string());
+            let path = exports_dir.join(&filename);
+            let mut file = std::fs::File::create(&path)
+                .map_err(|e| format!("Failed to create file: {}", e))?;
+            file.write_all(content.as_bytes())
+                .map_err(|e| format!("Failed to write file: {}", e))?;
+
+            Ok(crate::export::ExportResult {
+                path: path.to_string_lossy().to_string(),
+                page_count: 1,
+                format: request.format_string(),
+                scope: request.scope_string(),
+            })
+        }
+        crate::export::ExportScope::WholeCrawlOneFile | crate::export::ExportScope::WholeCrawlFolder => {
+            let crawl_id = request.crawl_id.as_ref().unwrap().clone();
+            let mut page_docs: Vec<crate::schema::PageDoc> = Vec::new();
+
+            if let Some(store) = &ctx.store {
+                let filter = mongodb::bson::doc! { "crawl_id": &crawl_id };
+                let mut cursor = store
+                    .pages_col()
+                    .find(filter)
+                    .await
+                    .map_err(|e| format!("Mongo query failed: {}", e))?;
+
+                while let Some(doc) = cursor
+                    .try_next()
+                    .await
+                    .map_err(|e| format!("Cursor error: {}", e))?
+                {
+                    page_docs.push(doc);
+                }
+            }
+
+            if page_docs.is_empty() {
+                let crawl_id_clone = crawl_id.clone();
+                let app_data_dir_clone = app_data_dir.clone();
+                page_docs = tokio::task::spawn_blocking(move || {
+                    let dir = std::path::PathBuf::from(&app_data_dir_clone);
+                    let read_dir = match std::fs::read_dir(&dir) {
+                        Ok(rd) => rd,
+                        Err(_) => return Vec::new(),
+                    };
+                    let mut docs = Vec::new();
+                    for entry in read_dir.flatten() {
+                        let path = entry.path();
+                        let filename = match path.file_name() {
+                            Some(n) => n.to_string_lossy().to_string(),
+                            None => continue,
+                        };
+                        if !filename.starts_with("crawl-") || !filename.ends_with(".jl") {
+                            continue;
+                        }
+                        let file_cid = filename
+                            .strip_prefix("crawl-")
+                            .unwrap_or("")
+                            .strip_suffix(".jl")
+                            .unwrap_or("");
+                        if file_cid != crawl_id_clone {
+                            continue;
+                        }
+                        let file = match std::fs::File::open(&path) {
+                            Ok(f) => f,
+                            Err(_) => continue,
+                        };
+                        let reader = std::io::BufReader::new(file);
+                        for line_result in std::io::BufRead::lines(reader) {
+                            let line = match line_result {
+                                Ok(l) => l,
+                                Err(_) => continue,
+                            };
+                            let trimmed = line.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            let item: serde_json::Value = match serde_json::from_str(trimmed) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            if item.get("crawl_id").and_then(|v| v.as_str()).unwrap_or("") != crawl_id_clone {
+                                continue;
+                            }
+                            let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let timestamp = item.get("timestamp").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let pd = crate::schema::PageDoc {
+                                crawl_id: crawl_id_clone.clone(),
+                                url: url.clone(),
+                                url_normalized: url.to_lowercase(),
+                                depth: item.get("depth").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                                title: item.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                status: "Completed".to_string(),
+                                status_code: 200,
+                                status_reason: None,
+                                content: item.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                content_format: "text".to_string(),
+                                content_bytes: None,
+                                discovered_links: 0,
+                                timestamp,
+                                duplicate_group_id: 0,
+                                search_blob: String::new(),
+                                extracted_title: item.get("extracted_title").and_then(|v| v.as_str()).map(String::from),
+                                author: item.get("author").and_then(|v| v.as_str()).map(String::from),
+                                published_date: item.get("published_date").and_then(|v| v.as_str()).map(String::from),
+                                excerpt: item.get("excerpt").and_then(|v| v.as_str()).map(String::from),
+                                reading_time_minutes: item.get("reading_time_minutes").and_then(|v| v.as_u64()).map(|v| v as u32),
+                                body_text: item.get("body_text").and_then(|v| v.as_str()).map(String::from),
+                                body_html: item.get("body_html").and_then(|v| v.as_str()).map(String::from),
+                                assets: item.get("assets").and_then(|v| serde_json::from_value(v.clone()).ok()),
+                                extraction_method: item.get("extraction_method").and_then(|v| v.as_str()).map(String::from),
+                                extraction_confidence: item.get("extraction_confidence").and_then(|v| v.as_f64()).map(|v| v as f32),
+                                thin_content: item.get("thin_content").and_then(|v| v.as_bool()),
+                            };
+                            docs.push(pd);
+                        }
+                    }
+                    docs
+                })
+                .await
+                .map_err(|e| format!("spawn_blocking panic: {}", e))?;
+            }
+
+            if page_docs.is_empty() {
+                return Err("No pages found for this crawl".to_string());
+            }
+
+            page_docs.sort_by(|a, b| a.depth.cmp(&b.depth).then(a.url.cmp(&b.url)));
+            let page_count = page_docs.len();
+
+            match request.format {
+                crate::export::ExportFormat::Epub => {
+                    let chapters: Vec<crate::export::EpubChapter> = page_docs
+                        .iter()
+                        .map(crate::export::page_to_epub_chapter)
+                        .collect();
+
+                    let book_title = chapters
+                        .first()
+                        .map(|c| c.title.clone())
+                        .unwrap_or_else(|| "Crasp Archive".to_string());
+
+                    let cover_url = page_docs
+                        .first()
+                        .and_then(|d| d.assets.as_ref())
+                        .and_then(|a| a.og_image.as_deref());
+
+                    let ts = chrono::Utc::now().timestamp_millis();
+                    let output_path = exports_dir.join(format!("{}_{}.epub", crawl_id, ts));
+
+                    crate::export::generate_epub(
+                        &chapters,
+                        &book_title,
+                        cover_url,
+                        &output_path,
+                    )?;
+
+                    Ok(crate::export::ExportResult {
+                        path: output_path.to_string_lossy().to_string(),
+                        page_count,
+                        format: request.format_string(),
+                        scope: request.scope_string(),
+                    })
+                }
+                _ => {
+                    match request.scope {
+                        crate::export::ExportScope::WholeCrawlOneFile => {
+                            let (ext, content) = match request.format {
+                                crate::export::ExportFormat::PlainText => (
+                                    "txt",
+                                    crate::export::pages_to_plain_text_combined(&page_docs, &request.content),
+                                ),
+                                crate::export::ExportFormat::Markdown => (
+                                    "md",
+                                    crate::export::pages_to_markdown_combined(&page_docs, &request.content),
+                                ),
+                                crate::export::ExportFormat::Html => (
+                                    "html",
+                                    crate::export::pages_to_html_combined(&page_docs, &request.content),
+                                ),
+                                _ => unreachable!(),
+                            };
+
+                            let ts = chrono::Utc::now().timestamp_millis();
+                            let filename = format!("{}_{}_{}_{}", crawl_id, ext, ts, request.scope_string());
+                            let path = exports_dir.join(&filename);
+                            let mut file = std::fs::File::create(&path)
+                                .map_err(|e| format!("Failed to create file: {}", e))?;
+                            file.write_all(content.as_bytes())
+                                .map_err(|e| format!("Failed to write file: {}", e))?;
+
+                            Ok(crate::export::ExportResult {
+                                path: path.to_string_lossy().to_string(),
+                                page_count,
+                                format: request.format_string(),
+                                scope: request.scope_string(),
+                            })
+                        }
+                        crate::export::ExportScope::WholeCrawlFolder => {
+                            let files = match request.format {
+                                crate::export::ExportFormat::PlainText => {
+                                    crate::export::pages_to_plain_text_folder(&page_docs, &request.content)
+                                }
+                                crate::export::ExportFormat::Markdown => {
+                                    crate::export::pages_to_markdown_folder(&page_docs, &request.content)
+                                }
+                                crate::export::ExportFormat::Html => {
+                                    crate::export::pages_to_html_folder(&page_docs, &request.content)
+                                }
+                                _ => unreachable!(),
+                            };
+
+                            let ts = chrono::Utc::now().timestamp_millis();
+                            let folder_name = format!("{}_{}_{}", crawl_id, request.format_string(), ts);
+                            let folder_path = exports_dir.join(&folder_name);
+                            std::fs::create_dir_all(&folder_path)
+                                .map_err(|e| format!("Failed to create folder: {}", e))?;
+
+                            for (filename, content) in files {
+                                let file_path = folder_path.join(&filename);
+                                let mut file = std::fs::File::create(&file_path)
+                                    .map_err(|e| format!("Failed to create file: {}", e))?;
+                                file.write_all(content.as_bytes())
+                                    .map_err(|e| format!("Failed to write file: {}", e))?;
+                            }
+
+                            Ok(crate::export::ExportResult {
+                                path: folder_path.to_string_lossy().to_string(),
+                                page_count,
+                                format: request.format_string(),
+                                scope: request.scope_string(),
+                            })
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl crate::export::ExportRequest {
+    fn format_string(&self) -> String {
+        match self.format {
+            crate::export::ExportFormat::PlainText => "plain_text".to_string(),
+            crate::export::ExportFormat::Markdown => "markdown".to_string(),
+            crate::export::ExportFormat::Html => "html".to_string(),
+            crate::export::ExportFormat::Epub => "epub".to_string(),
+        }
+    }
+
+    fn scope_string(&self) -> String {
+        match self.scope {
+            crate::export::ExportScope::SinglePage => "single_page".to_string(),
+            crate::export::ExportScope::WholeCrawlOneFile => "whole_crawl_one_file".to_string(),
+            crate::export::ExportScope::WholeCrawlFolder => "whole_crawl_folder".to_string(),
         }
     }
 }
 
 #[tauri::command]
-pub async fn export_page(
-    url: String,
-    source: StorageSource,
-    crawl_id: Option<String>,
-    format: String,
-    ctx: tauri::State<'_, Arc<AppContext>>,
-) -> Result<String, String> {
-    let content = get_page_content(url.clone(), source, crawl_id, ctx).await?;
-
-    let content = match content {
-        Some(c) if !c.is_empty() => c,
-        _ => return Err("Page has no content or was not found".to_string()),
-    };
-
-    let slug: String = url
-        .split('/')
-        .filter(|s| !s.is_empty() && *s != "http:" && *s != "https:")
-        .last()
-        .unwrap_or("page")
-        .chars()
-        .take(30)
-        .collect();
-
-    let ext = if format == "md" { "md" } else { "txt" };
-    let ts = chrono::Utc::now().timestamp_millis();
-    let filename = format!("{}_{}.{}", slug, ts, ext);
-
-    use std::io::Write;
-    let dir = std::env::temp_dir().join("crasp_exports");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create export dir: {}", e))?;
-    let path = dir.join(&filename);
-    let mut file =
-        std::fs::File::create(&path).map_err(|e| format!("Failed to create file: {}", e))?;
-    file.write_all(content.as_bytes())
-        .map_err(|e| format!("Failed to write file: {}", e))?;
-
-    Ok(path.to_string_lossy().to_string())
+pub fn reveal_in_explorer(
+    path: String,
+) -> Result<(), String> {
+    std::process::Command::new("explorer")
+        .arg("/select,")
+        .arg(&path)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]

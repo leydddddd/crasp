@@ -283,6 +283,17 @@ pub async fn persist_items(
             },
             duplicate_group_id: 0,
             search_blob,
+            extracted_title: item.get("extracted_title").and_then(|v| v.as_str()).map(String::from),
+            author: item.get("author").and_then(|v| v.as_str()).map(String::from),
+            published_date: item.get("published_date").and_then(|v| v.as_str()).map(String::from),
+            excerpt: item.get("excerpt").and_then(|v| v.as_str()).map(String::from),
+            reading_time_minutes: item.get("reading_time_minutes").and_then(|v| v.as_u64()).map(|v| v as u32),
+            body_text: item.get("body_text").and_then(|v| v.as_str()).map(String::from),
+            body_html: item.get("body_html").and_then(|v| v.as_str()).map(String::from),
+            assets: item.get("assets").and_then(|v| serde_json::from_value(v.clone()).ok()),
+            extraction_method: item.get("extraction_method").and_then(|v| v.as_str()).map(String::from),
+            extraction_confidence: item.get("extraction_confidence").and_then(|v| v.as_f64()).map(|v| v as f32),
+            thin_content: item.get("thin_content").and_then(|v| v.as_bool()),
         };
         pages.push(page);
 

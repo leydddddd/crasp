@@ -50,6 +50,38 @@ export interface CrawlConfig {
   hash_algorithm: HashAlgorithm;
 }
 
+export interface AssetImage {
+  src: string;
+  alt: string | null;
+  caption: string | null;
+  in_main_content: boolean;
+  width: number | null;
+  height: number | null;
+}
+
+export interface AssetVideo {
+  src: string;
+  kind: string;
+  video_id: string | null;
+  in_main_content: boolean;
+}
+
+export interface AssetDocument {
+  src: string;
+  link_text: string | null;
+  mime_type: string | null;
+  in_main_content: boolean;
+}
+
+export interface PageAssets {
+  images: AssetImage[];
+  videos: AssetVideo[];
+  documents: AssetDocument[];
+  og_image: string | null;
+  og_description: string | null;
+  og_published_time: string | null;
+}
+
 export interface ArchivedPage {
   url: string;
   depth: number;
@@ -61,6 +93,17 @@ export interface ArchivedPage {
   discovered_links: number;
   timestamp: string;
   crawl_id: string | null;
+  extracted_title: string | null;
+  author: string | null;
+  published_date: string | null;
+  excerpt: string | null;
+  reading_time_minutes: number | null;
+  body_text: string | null;
+  body_html: string | null;
+  assets: PageAssets | null;
+  extraction_method: string | null;
+  extraction_confidence: number | null;
+  thin_content: boolean | null;
 }
 
 export interface CrawlDiscoverPayload {
@@ -134,6 +177,17 @@ export interface PageSummary {
   timestamp: string;
   source: StorageSource;
   content_preview: string | null;
+  extracted_title: string | null;
+  author: string | null;
+  published_date: string | null;
+  excerpt: string | null;
+  reading_time_minutes: number | null;
+  body_text: string | null;
+  body_html: string | null;
+  assets: PageAssets | null;
+  extraction_method: string | null;
+  extraction_confidence: number | null;
+  thin_content: boolean | null;
 }
 
 export interface MongoConnectionStatus {
@@ -159,6 +213,26 @@ export function storageSourceLabel(source: StorageSource): string {
   if (source === "Mongo") return "MongoDB";
   if (typeof source === "object" && "LocalFile" in source) return `Local file: ${source.LocalFile.path}`;
   return "Unknown";
+}
+
+export type ExportFormat = "plain_text" | "markdown" | "html" | "epub";
+export type ExportScope = "single_page" | "whole_crawl_one_file" | "whole_crawl_folder";
+export type ExportContent = "content_only" | "with_metadata" | "with_assets" | "full";
+
+export interface ExportRequest {
+  format: ExportFormat;
+  scope: ExportScope;
+  content: ExportContent;
+  pageUrl?: string;
+  crawlId?: string;
+  source?: StorageSource;
+}
+
+export interface ExportResult {
+  path: string;
+  page_count: number;
+  format: ExportFormat;
+  scope: ExportScope;
 }
 
 export function storageUsedLabel(su: StorageUsed): string {

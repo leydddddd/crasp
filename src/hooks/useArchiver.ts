@@ -20,6 +20,8 @@ import type {
   ZyteConnectionStatus,
   PageSummary,
   StorageSource,
+  ExportRequest,
+  ExportResult,
 } from "@/types/archiver";
 
 const MAX_QUEUE_DISPLAY = 500;
@@ -171,6 +173,19 @@ export function useArchiver() {
       await invoke("open_data_folder");
     } catch (e) {
       console.error("Failed to open data folder:", e);
+    }
+  }, []);
+
+  const exportContent = useCallback(async (request: ExportRequest): Promise<ExportResult> => {
+    const result = await invoke<ExportResult>("export_content", { request });
+    return result;
+  }, []);
+
+  const revealInExplorer = useCallback(async (path: string) => {
+    try {
+      await invoke("reveal_in_explorer", { path });
+    } catch (e) {
+      console.error("Failed to reveal in explorer:", e);
     }
   }, []);
 
@@ -542,6 +557,8 @@ export function useArchiver() {
     crawlSummary,
     dismissSummary,
     openDataFolder,
+    exportContent,
+    revealInExplorer,
   };
 }
 

@@ -1,11 +1,13 @@
 pub mod commands;
 pub mod crawler;
+pub mod extraction;
 mod local_scrapy;
 mod logging;
 pub mod runtime;
 mod schema;
 pub mod ssrf;
 mod store;
+pub mod export;
 mod zyte;
 
 use std::sync::Arc;
@@ -35,7 +37,8 @@ pub fn run() {
             commands::list_archived_pages,
             commands::list_local_crawls,
             commands::get_page_content,
-            commands::export_page,
+            commands::export_content,
+            commands::reveal_in_explorer,
             commands::open_data_folder,
             commands::get_last_crawl_summary,
         ])

@@ -22,9 +22,11 @@ import {
   FolderOpen,
   X,
   AlertTriangle,
+  FileDown,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useArchiver } from "@/hooks/useArchiver";
+import { ExportPanel } from "@/components/ExportPanel";
 import type {
   ArchivedPage,
   PageStatus,
@@ -36,6 +38,7 @@ import type {
   StorageSource,
   StorageUsed,
 } from "@/types/archiver";
+// Note: deprecated export_page and export_crawl_epub handlers removed in WI-32-E
 import { storageUsedLabel } from "@/types/archiver";
 
 const ENGINE_OPTIONS: { value: Engine; label: string; icon: React.ReactNode }[] = [
@@ -87,6 +90,10 @@ export function ArchiverDashboard() {
   const [activeTab, setActiveTab] = useState<"config" | "logs" | "archive">("config");
   const [selectedPage, setSelectedPage] = useState<ArchivedPage | null>(null);
   const [selectedArchivePage, setSelectedArchivePage] = useState<PageSummary | null>(null);
+  const [exportPanelOpen, setExportPanelOpen] = useState(false);
+  const [exportPanelContext, setExportPanelContext] = useState<"single_page" | "whole_crawl">("single_page");
+  const [exportPanelPage, setExportPanelPage] = useState<PageSummary | null>(null);
+  const [exportPanelCrawlId, setExportPanelCrawlId] = useState<string | null>(null);
   const parentRef = useRef<HTMLDivElement>(null);
 
   const statusColor: Record<ArchiveStatus, string> = {
@@ -123,6 +130,13 @@ export function ArchiverDashboard() {
   }, [archiver.startCrawl]);
 
   const isIdle = archiver.status === "idle";
+
+  const openExportPanel = useCallback((context: "single_page" | "whole_crawl", page?: PageSummary | null, crawlId?: string | null) => {
+    setExportPanelContext(context);
+    setExportPanelPage(page || null);
+    setExportPanelCrawlId(crawlId || null);
+    setExportPanelOpen(true);
+  }, []);
 
   return (
     <div className="flex h-screen w-screen flex-col bg-gray-950 text-gray-100 overflow-hidden">
@@ -551,6 +565,15 @@ export function ArchiverDashboard() {
               loading={archiver.loadingArchived}
               selectedPage={selectedArchivePage}
               onSelectPage={setSelectedArchivePage}
+              onExportPage={(page) => openExportPanel("single_page", page)}
+              onExportCrawl={(crawlId) => openExportPanel("whole_crawl", null, crawlId)}
+            />
+            <ExportPanel
+              open={exportPanelOpen}
+              onClose={() => setExportPanelOpen(false)}
+              context={exportPanelContext}
+              page={exportPanelPage}
+              crawlId={exportPanelCrawlId}
             />
           </main>
         ) : (
@@ -807,6 +830,40 @@ function DetailDrawer({
           </p>
         </div>
       </div>
+      {(page.author || page.published_date || page.reading_time_minutes || page.excerpt || page.thin_content) && (
+        <div className="grid grid-cols-3 gap-4 px-4 pb-4 text-xs">
+          {page.author && (
+            <div>
+              <span className="text-gray-500">Author</span>
+              <p className="mt-0.5 text-gray-300">{page.author}</p>
+            </div>
+          )}
+          {page.published_date && (
+            <div>
+              <span className="text-gray-500">Published</span>
+              <p className="mt-0.5 text-gray-300">{page.published_date}</p>
+            </div>
+          )}
+          {page.reading_time_minutes != null && page.reading_time_minutes > 0 && (
+            <div>
+              <span className="text-gray-500">Reading time</span>
+              <p className="mt-0.5 text-gray-300">{page.reading_time_minutes} min</p>
+            </div>
+          )}
+        </div>
+      )}
+      {page.excerpt && (
+        <div className="px-4 pb-3 text-xs">
+          <span className="text-gray-500">Excerpt</span>
+          <p className="mt-0.5 text-gray-400 italic">{page.excerpt}</p>
+        </div>
+      )}
+      {page.thin_content && (
+        <div className="mx-4 mb-3 flex items-center gap-1.5 rounded-md bg-amber-900/20 px-2.5 py-1.5 text-xs text-amber-400 border border-amber-800/40">
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+          <span>Thin content — JS rendering may be needed</span>
+        </div>
+      )}
       {stageLabel && (
         <div className="border-t border-gray-800/50 px-4 py-2 text-xs">
           <span className="text-gray-500">Stage:</span>{" "}
@@ -1039,36 +1096,46 @@ function ArchiveViewer({
   loading,
   selectedPage,
   onSelectPage,
+  onExportPage,
+  onExportCrawl,
 }: {
   pages: PageSummary[];
   loading: boolean;
   selectedPage: PageSummary | null;
   onSelectPage: (p: PageSummary | null) => void;
+  onExportPage: (page: PageSummary) => void;
+  onExportCrawl: (crawlId: string) => void;
 }) {
-  const [exporting, setExporting] = useState<string | null>(null);
   const [previewPage, setPreviewPage] = useState<PageSummary | null>(null);
   const [previewContent, setPreviewContent] = useState<string | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
 
-  const handleExport = useCallback(async (page: PageSummary, format: string) => {
-    setExporting(page.url);
-    try {
-      const source = page.source === "Mongo"
-        ? "Mongo"
-        : { LocalFile: { path: (page.source as { LocalFile: { path: string } }).LocalFile.path } };
-      const path = await invoke<string>("export_page", {
-        url: page.url,
-        source,
-        format,
-        crawlId: null,
-      });
-      alert(`Exported to: ${path}`);
-    } catch (e) {
-      alert(`Export failed: ${e}`);
-    } finally {
-      setExporting(null);
+  const assetCounts = useMemo(() => {
+    let images = 0;
+    let documents = 0;
+    let pagesWithAssets = 0;
+    for (const p of pages) {
+      if (p.assets && (p.assets.images.length > 0 || p.assets.documents.length > 0)) {
+        images += p.assets.images.length;
+        documents += p.assets.documents.length;
+        pagesWithAssets++;
+      }
     }
-  }, []);
+    return { images, documents, pagesWithAssets };
+  }, [pages]);
+
+  const crawlIds = useMemo(() => {
+    const ids = new Map<string, number>();
+    for (const p of pages) {
+      const cid = (p as unknown as Record<string, unknown>).crawl_id as string | null;
+      if (cid) {
+        ids.set(cid, (ids.get(cid) || 0) + 1);
+      }
+    }
+    return ids;
+  }, [pages]);
+
+
 
   const handlePreview = useCallback(async (page: PageSummary) => {
     if (previewPage?.url === page.url) {
@@ -1125,7 +1192,28 @@ function ArchiveViewer({
       <div className="flex items-center justify-between border-b border-gray-800 px-4 py-2">
         <h2 className="text-xs font-semibold uppercase tracking-wider text-gray-400">
           Archived Pages ({pages.length})
+          {assetCounts.images > 0 && (
+            <span className="ml-2 text-[10px] font-normal text-gray-600">
+              {assetCounts.images} images, {assetCounts.documents} documents across {assetCounts.pagesWithAssets} pages
+            </span>
+          )}
         </h2>
+        {crawlIds.size > 0 && (
+          <div className="flex items-center gap-1.5">
+            {Array.from(crawlIds.entries())
+              .filter(([, count]) => count > 1)
+              .map(([crawlId, count]) => (
+                <button
+                  key={crawlId}
+                  onClick={() => onExportCrawl(crawlId)}
+                  className="flex items-center gap-1 rounded-md bg-crasp-600/20 px-2.5 py-1 text-[10px] font-medium text-crasp-400 hover:bg-crasp-600/30 transition-colors"
+                >
+                  <FileDown className="h-3 w-3" />
+                  Export ({count} pages)
+                </button>
+              ))}
+          </div>
+        )}
       </div>
       <div className="flex-1 overflow-auto">
         <table className="w-full text-xs">
@@ -1162,6 +1250,11 @@ function ArchiveViewer({
                     {page.stage}
                     {page.status_reason ? `: ${page.status_reason}` : ""}
                   </span>
+                  {page.thin_content && (
+                    <span className="ml-1 inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[9px] bg-amber-900/20 text-amber-400 border border-amber-800/30">
+                      <AlertTriangle className="h-2.5 w-2.5" />thin
+                    </span>
+                  )}
                 </td>
                 <td className="px-3 py-2">
                   {sourceBadge(page.source)}
@@ -1182,18 +1275,10 @@ function ArchiveViewer({
                       <Search className="h-3 w-3" />
                     </button>
                     <button
-                      onClick={(e) => { e.stopPropagation(); handleExport(page, "txt"); }}
-                      disabled={exporting === page.url}
-                      className="rounded px-1 py-0.5 text-[10px] bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-gray-200 transition-colors disabled:opacity-50"
+                      onClick={(e) => { e.stopPropagation(); onExportPage(page); }}
+                      className="rounded px-1 py-0.5 text-[10px] bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-gray-200 transition-colors"
                     >
-                      .txt
-                    </button>
-                    <button
-                      onClick={(e) => { e.stopPropagation(); handleExport(page, "md"); }}
-                      disabled={exporting === page.url}
-                      className="rounded px-1 py-0.5 text-[10px] bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-gray-200 transition-colors disabled:opacity-50"
-                    >
-                      .md
+                      Export
                     </button>
                   </div>
                 </td>
@@ -1221,6 +1306,27 @@ function ArchiveViewer({
             </div>
           </div>
           <div className="p-4">
+            {(previewPage.author || previewPage.published_date || (previewPage.reading_time_minutes != null && previewPage.reading_time_minutes > 0) || previewPage.thin_content) && (
+              <div className="mb-3 flex flex-wrap items-center gap-3 text-[11px]">
+                {previewPage.author && (
+                  <span className="text-gray-500">Author: <span className="text-gray-300">{previewPage.author}</span></span>
+                )}
+                {previewPage.published_date && (
+                  <span className="text-gray-500">Published: <span className="text-gray-300">{previewPage.published_date}</span></span>
+                )}
+                {previewPage.reading_time_minutes != null && previewPage.reading_time_minutes > 0 && (
+                  <span className="text-gray-500">Reading time: <span className="text-gray-300">{previewPage.reading_time_minutes} min</span></span>
+                )}
+                {previewPage.excerpt && (
+                  <span className="text-gray-500" title={previewPage.excerpt}>Excerpt: <span className="text-gray-400 italic truncate max-w-[200px] inline-block align-bottom">{previewPage.excerpt}</span></span>
+                )}
+                {previewPage.thin_content && (
+                  <span className="inline-flex items-center gap-1 rounded bg-amber-900/20 px-1.5 py-0.5 text-amber-400 border border-amber-800/30">
+                    <AlertTriangle className="h-2.5 w-2.5" />Thin content
+                  </span>
+                )}
+              </div>
+            )}
             {previewLoading ? (
               <div className="flex items-center justify-center py-6 text-gray-500">
                 <Loader2 className="h-5 w-5 animate-spin mr-2" />
