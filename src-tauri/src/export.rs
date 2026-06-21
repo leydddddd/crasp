@@ -111,6 +111,9 @@ pub fn page_to_plain_text(page: &PageDoc, content: &ExportContent) -> String {
 }
 
 fn page_content_only_plain(page: &PageDoc) -> String {
+    if is_extraction_failed(page) {
+        return extraction_failed_plain(page);
+    }
     get_body_text(page).to_string()
 }
 
@@ -171,7 +174,13 @@ fn page_full_plain(page: &PageDoc) -> String {
 
 pub fn page_to_markdown(page: &PageDoc, content: &ExportContent) -> String {
     match content {
-        ExportContent::ContentOnly => get_body_text(page).to_string(),
+        ExportContent::ContentOnly => {
+            if is_extraction_failed(page) {
+                extraction_failed_markdown(page)
+            } else {
+                get_body_text(page).to_string()
+            }
+        }
         ExportContent::WithMetadata => page_doc_to_markdown(page),
         ExportContent::WithAssets => page_to_markdown_with_assets(page),
         ExportContent::Full => page_to_markdown_full(page),
@@ -290,7 +299,7 @@ fn page_html_full(page: &PageDoc) -> String {
 }
 
 fn minimal_reading_stylesheet() -> &'static str {
-    "body { max-width: 720px; margin: 2rem auto; font-family: Georgia, serif; font-size: 1.1rem; line-height: 1.7; color: #1a1a1a; padding: 0 1rem; } img { max-width: 100%; height: auto; } a { color: #1a6ea8; } blockquote { border-left: 3px solid #ccc; margin: 0; padding-left: 1rem; color: #555; } pre { background: #f5f5f5; padding: 1rem; overflow-x: auto; } figure { margin: 1.5rem 0; } figcaption { font-size: 0.85rem; color: #666; text-align: center; margin-top: 0.5rem; }"
+    "body { max-width: 720px; margin: 2rem auto; font-family: Georgia, serif; font-size: 1.1rem; line-height: 1.7; color: #1a1a1a; padding: 0 1rem; } img { max-width: 100%; height: auto; } a { color: #1a6ea8; } blockquote { border-left: 3px solid #ccc; margin: 0; padding-left: 1rem; color: #555; } pre { background: #f5f5f5; padding: 1rem; overflow-x: auto; } figure { margin: 1.5rem 0; } figcaption { font-size: 0.85rem; color: #666; text-align: center; margin-top: 0.5rem; } .extraction-failed { border: 2px dashed #e0a800; background: #fffbec; padding: 1.5rem; border-radius: 4px; color: #7a5c00; margin: 1rem 0; } .extraction-failed p { margin: 0.5rem 0; }"
 }
 
 // =============================================================================
@@ -462,13 +471,23 @@ pub fn page_to_epub_chapter(page: &PageDoc) -> EpubChapter {
         .unwrap_or("Untitled")
         .to_string();
 
-    let body = page
-        .body_html
-        .as_deref()
-        .or_else(|| if page.content.is_empty() { None } else { Some(page.content.as_str()) })
-        .unwrap_or("<p>No content extracted.</p>");
+    let raw_body = if is_extraction_failed(page) {
+        format!(
+            "<p><em>Content extraction failed for this page. \
+             Confidence: {:.2}. \
+             <a href=\"{}\">View original</a></em></p>",
+            page.extraction_confidence.unwrap_or(0.0),
+            html_escape_attr(&page.url)
+        )
+    } else {
+        page.body_html
+            .as_deref()
+            .or_else(|| if page.content.is_empty() { None } else { Some(page.content.as_str()) })
+            .unwrap_or("<p>No content extracted.</p>")
+            .to_string()
+    };
 
-    let xhtml_body = html_to_xhtml(body);
+    let xhtml_body = html_to_xhtml(&raw_body);
 
     let content = format!(
         "<html xmlns=\"http://www.w3.org/1999/xhtml\">\n<head><title>{}</title></head>\n<body>\n<p class=\"source\">Source: <a href=\"{}\">{}</a></p>\n{}\n</body>\n</html>",
@@ -523,7 +542,9 @@ pub fn generate_epub(
     let css = "body { font-family: Georgia, serif; margin: 1em; line-height: 1.7; }\n\
                h1 { font-size: 1.5em; }\n\
                p.source { font-size: 0.85em; color: #666; margin-bottom: 1.5em; }\n\
-               img { max-width: 100%; }";
+               img { max-width: 100%; }\n\
+               .extraction-failed { border: 2px dashed #e0a800; background: #fffbec; padding: 1.5rem; border-radius: 4px; color: #7a5c00; margin: 1rem 0; }\n\
+               .extraction-failed p { margin: 0.5rem 0; }";
     builder
         .stylesheet(css.as_bytes())
         .map_err(|e| format!("Failed to set stylesheet: {}", e))?;
@@ -548,78 +569,115 @@ pub fn generate_epub(
 }
 
 fn html_to_xhtml(html: &str) -> String {
-    let mut result = html.replace("<br>", "<br />");
-    result = result.replace("<hr>", "<hr />");
-
-    let mut img_fixed = String::with_capacity(result.len());
-    let mut i = 0;
-    let bytes = result.as_bytes();
-    while i < bytes.len() {
-        if i + 4 <= bytes.len() && &bytes[i..i+4] == b"<img" {
-            let tag_start = i;
-            let mut j = i + 4;
-            let mut found_close = false;
-            while j < bytes.len() {
-                if bytes[j] == b'>' {
-                    if j > 0 && bytes[j-1] == b'/' {
-                        found_close = true;
-                    } else {
-                        img_fixed.push_str(&result[tag_start..j]);
-                        img_fixed.push_str(" /");
-                        found_close = true;
-                    }
-                    if found_close {
-                        img_fixed.push('>');
-                        i = j + 1;
-                    }
-                    break;
-                }
-                j += 1;
-            }
-            if !found_close {
-                img_fixed.push_str(&result[tag_start..]);
-                break;
-            }
-        } else {
-            img_fixed.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-
-    encode_bare_ampersands(&img_fixed)
+    let no_scripts = strip_scripts_and_styles(html);
+    let self_closed = self_close_void_elements(&no_scripts);
+    escape_bare_ampersands(&self_closed)
 }
 
-fn encode_bare_ampersands(s: &str) -> String {
+fn strip_scripts_and_styles(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
-    let chars: Vec<char> = s.chars().collect();
+    let lower = s.to_ascii_lowercase();
     let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '&' {
-            let is_entity = if i + 1 < chars.len() && chars[i + 1] == '#' {
-                true
-            } else if i + 1 < chars.len() && chars[i + 1].is_ascii_alphabetic() {
-                let mut j = i + 1;
-                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '-') {
-                    if chars[j] == ';' {
-                        break;
-                    }
-                    j += 1;
-                }
-                j < chars.len() && chars[j] == ';'
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        let remaining = &lower[i..];
+        if remaining.starts_with("<script") {
+            if let Some(end) = lower[i..].find("</script>") {
+                i += end + 9;
+                continue;
             } else {
-                false
-            };
-            if is_entity {
-                result.push('&');
-            } else {
-                result.push_str("&");
+                break;
             }
-        } else {
-            result.push(chars[i]);
         }
+        if remaining.starts_with("<style") {
+            if let Some(end) = lower[i..].find("</style>") {
+                i += end + 8;
+                continue;
+            } else {
+                break;
+            }
+        }
+        result.push(bytes[i] as char);
         i += 1;
     }
     result
+}
+
+fn self_close_void_elements(s: &str) -> String {
+    const VOID: &[&str] = &[
+        "area", "base", "br", "col", "embed", "hr", "img",
+        "input", "link", "meta", "param", "source", "track", "wbr"
+    ];
+    let mut result = s.to_string();
+    for tag in VOID {
+        result = fix_void_element(&result, tag);
+    }
+    result
+}
+
+fn fix_void_element(html: &str, tag: &str) -> String {
+    let open = format!("<{}", tag);
+    let mut out = String::with_capacity(html.len());
+    let mut pos = 0;
+    while pos < html.len() {
+        if html[pos..].to_ascii_lowercase().starts_with(&open) {
+            if let Some(end) = html[pos..].find('>') {
+                let tag_slice = &html[pos..pos + end + 1];
+                if !tag_slice.ends_with("/>") {
+                    out.push_str(&html[pos..pos + end]);
+                    out.push_str(" />");
+                } else {
+                    out.push_str(tag_slice);
+                }
+                pos += end + 1;
+                continue;
+            }
+        }
+        out.push(html.as_bytes()[pos] as char);
+        pos += 1;
+    }
+    out
+}
+
+fn escape_bare_ampersands(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '&' {
+            let mut entity = String::new();
+            let mut found_semi = false;
+            let mut lookahead: Vec<char> = Vec::new();
+            while let Some(&nc) = chars.peek() {
+                if nc == ';' {
+                    lookahead.push(chars.next().unwrap());
+                    found_semi = true;
+                    break;
+                } else if nc.is_whitespace() || nc == '<' || nc == '>' || nc == '&' {
+                    break;
+                } else if entity.len() > 8 {
+                    break;
+                } else {
+                    lookahead.push(chars.next().unwrap());
+                    entity.push(nc);
+                }
+            }
+            let is_valid_entity = found_semi && (
+                matches!(entity.as_str(), "amp" | "lt" | "gt" | "quot" | "apos")
+                || entity.starts_with('#')
+            );
+            if is_valid_entity {
+                out.push('&');
+                out.push_str(&entity);
+                out.push(';');
+            } else {
+                out.push_str("&amp;");
+                for lc in lookahead { out.push(lc); }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 // =============================================================================
@@ -649,8 +707,12 @@ pub fn page_doc_to_markdown(page: &PageDoc) -> String {
 
     out.push_str("\n---\n\n");
 
-    let body = get_body_text(page);
-    out.push_str(body);
+    if is_extraction_failed(page) {
+        out.push_str(&extraction_failed_markdown(page));
+    } else {
+        let body = get_body_text(page);
+        out.push_str(body);
+    }
     out.push_str("\n\n---\n");
 
     out
@@ -690,13 +752,15 @@ pub fn page_doc_to_html(page: &PageDoc) -> String {
     out.push_str("    body { max-width: 720px; margin: 2rem auto; font-family: Georgia, serif;\n");
     out.push_str("           font-size: 1.1rem; line-height: 1.7; color: #1a1a1a; padding: 0 1rem; }\n");
     out.push_str("    h1 { font-size: 1.8rem; line-height: 1.3; margin-bottom: 0.5rem; }\n");
-    out.push_str("    ..ensurewithinull margin-bottom: 2rem; border-bottom: 1px solid #eee; padding-bottom: 1rem; }\n");
+    out.push_str("    .meta { margin-bottom: 2rem; border-bottom: 1px solid #eee; padding-bottom: 1rem; }\n");
     out.push_str("    img { max-width: 100%; height: auto; }\n");
     out.push_str("    a { color: #1a6ea8; }\n");
     out.push_str("    blockquote { border-left: 3px solid #ccc; margin: 0; padding-left: 1rem; color: #555; }\n");
     out.push_str("    pre { background: #f5f5f5; padding: 1rem; overflow-x: auto; }\n");
     out.push_str("    figure { margin: 1.5rem 0; }\n");
     out.push_str("    figcaption { font-size: 0.85rem; color: #666; text-align: center; margin-top: 0.5rem; }\n");
+    out.push_str("    .extraction-failed { border: 2px dashed #e0a800; background: #fffbec; padding: 1.5rem; border-radius: 4px; color: #7a5c00; margin: 1rem 0; }\n");
+    out.push_str("    .extraction-failed p { margin: 0.5rem 0; }\n");
     out.push_str("  </style>\n");
     out.push_str("</head>\n<body>\n");
 
@@ -726,11 +790,12 @@ pub fn page_doc_to_html(page: &PageDoc) -> String {
     }
     out.push_str("  </div>\n");
 
-    let body_html = page
-        .body_html
-        .as_deref()
-        .unwrap_or_else(|| if page.content.is_empty() { "" } else { &page.content });
-    out.push_str(body_html);
+    let body_html = if is_extraction_failed(page) {
+        extraction_failed_html(page)
+    } else {
+        get_body_html_raw(page).to_string()
+    };
+    out.push_str(&body_html);
     out.push_str("\n</body>\n</html>\n");
 
     out
@@ -748,13 +813,72 @@ fn get_title(page: &PageDoc) -> &str {
         .unwrap_or("Untitled")
 }
 
+fn is_extraction_failed(page: &PageDoc) -> bool {
+    if page.extraction_method.as_deref() == Some("failed") {
+        return true;
+    }
+    let body_html_empty = page.body_html.as_deref().unwrap_or("").trim().is_empty();
+    let body_text_empty = page.body_text.as_deref().unwrap_or("").trim().is_empty();
+    body_html_empty && body_text_empty
+}
+
+fn extraction_failed_html(page: &PageDoc) -> String {
+    let confidence = page.extraction_confidence.unwrap_or(0.0);
+    format!(
+        "<div class=\"extraction-failed\">\n\
+         <p><strong>&#9888; Content extraction failed for this page.</strong></p>\n\
+         <p>The page may use JavaScript rendering, or its structure could not be \
+         parsed by the readability or CSS-selector extraction methods.</p>\n\
+         <p>Confidence score: {:.2}</p>\n\
+         <p>Original URL: <a href=\"{}\">{}</a></p>\n\
+         </div>",
+        confidence,
+        html_escape_attr(&page.url),
+        html_escape_text(&page.url)
+    )
+}
+
+fn extraction_failed_markdown(page: &PageDoc) -> String {
+    let confidence = page.extraction_confidence.unwrap_or(0.0);
+    format!(
+        "> \u{26a0} Content extraction failed for this page.\n\
+         > The page may use JavaScript rendering.\n\
+         > Confidence: {:.2}\n\
+         > Original URL: {}",
+        confidence,
+        page.url
+    )
+}
+
+fn extraction_failed_plain(page: &PageDoc) -> String {
+    let confidence = page.extraction_confidence.unwrap_or(0.0);
+    format!(
+        "[EXTRACTION FAILED]\n\
+         This page could not be parsed by the readability or CSS-selector methods.\n\
+         Confidence: {:.2}\n\
+         Original URL: {}",
+        confidence,
+        page.url
+    )
+}
+
 fn get_body_text(page: &PageDoc) -> &str {
     page.body_text
         .as_deref()
         .unwrap_or_else(|| if page.content.is_empty() { "No content extracted." } else { &page.content })
 }
 
-fn get_body_html(page: &PageDoc) -> &str {
+fn get_body_html(page: &PageDoc) -> String {
+    if is_extraction_failed(page) {
+        return extraction_failed_html(page);
+    }
+    page.body_html
+        .as_deref()
+        .unwrap_or_else(|| if page.content.is_empty() { "" } else { &page.content })
+        .to_string()
+}
+
+fn get_body_html_raw(page: &PageDoc) -> &str {
     page.body_html
         .as_deref()
         .unwrap_or_else(|| if page.content.is_empty() { "" } else { &page.content })
@@ -764,9 +888,9 @@ fn html_escape_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
-            '&' => out.push_str("&"),
-            '<' => out.push_str("<"),
-            '>' => out.push_str(">"),
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
             '"' => out.push_str("&#34;"),
             _ => out.push(c),
         }

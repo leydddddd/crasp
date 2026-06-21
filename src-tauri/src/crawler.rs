@@ -747,7 +747,10 @@ async fn process_page(
     page.assets = Some(assets);
     page.extraction_method = Some(extraction.extraction_method().to_string());
     page.extraction_confidence = Some(extraction.confidence);
-    let is_thin = extraction.thin_content;
+    let extraction_method_str = extraction.extraction_method().to_string();
+    let extraction_confidence_val = extraction.confidence;
+    let extraction_failed_flag = extraction.extraction_failed;
+    let is_thin = extraction.thin_content || extraction_failed_flag;
     page.thin_content = Some(is_thin);
     let non_ws_count = if is_thin {
         extraction.body_text.chars().filter(|c| !c.is_whitespace()).count()
@@ -755,11 +758,18 @@ async fn process_page(
         0
     };
 
-    if is_thin {
+    let _ = emit_log(emitter, "info", "local", &format!(
+        "Extraction: {} → method={}, confidence={:.2}, thin={}",
+        url_str, extraction_method_str, extraction_confidence_val, is_thin
+    ));
+
+    if is_thin || extraction_failed_flag {
+        let reason = if extraction_failed_flag { "extraction failed" } else { "may require JS rendering" };
         let _ = emit_log(emitter, "warn", "local", &format!(
-            "Thin content detected on {} ({} chars) — may require JS rendering",
+            "Thin content detected on {} ({} chars) — {}",
             url_str,
-            non_ws_count
+            non_ws_count,
+            reason
         ));
     }
 

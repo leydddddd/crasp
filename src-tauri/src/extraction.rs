@@ -15,12 +15,13 @@ pub struct ExtractionResult {
     pub reading_time_minutes: u32,
     pub confidence: f32,
     pub thin_content: bool,
-    method: &'static str,
+    pub extraction_failed: bool,
+    method: String,
 }
 
 impl ExtractionResult {
-    pub fn extraction_method(&self) -> &'static str {
-        self.method
+    pub fn extraction_method(&self) -> &str {
+        &self.method
     }
 
     pub fn raw_fallback() -> Self {
@@ -34,98 +35,175 @@ impl ExtractionResult {
             reading_time_minutes: 0,
             confidence: 0.0,
             thin_content: true,
-            method: "raw",
+            extraction_failed: true,
+            method: "raw".to_string(),
         }
     }
 }
 
 pub fn extract_main_content(html: &str, base_url: &str) -> ExtractionResult {
-    let full_text = extract_full_text(html);
+    let full_text = extract_all_text(html);
 
-    let (title, body_html, body_text, method) = match try_readability(html, base_url) {
-        Some(product) => {
-            let ratio = word_ratio(&product.text, &full_text);
-            if ratio >= 0.2 && !product.text.trim().is_empty() {
-                (Some(product.title), product.content, product.text, "readability")
+    if let Some(product) = try_readability(html, base_url) {
+        let confidence = calculate_confidence(&product.content, &product.text, &full_text);
+
+        if confidence >= 0.40 {
+            let non_ws_len = product.text.chars().filter(|c| !c.is_whitespace()).count();
+            let thin_content = non_ws_len < 200;
+            let word_count = product.text.split_whitespace().count();
+            let reading_time_minutes = if word_count == 0 {
+                0
             } else {
-                let fallback = fallback_css_extraction(html);
-                (Some(product.title), fallback.0, fallback.1, "css_selector")
-            }
+                ((word_count as f32 / 200.0).ceil() as u32).max(1)
+            };
+            let author = extract_author(html);
+            let published_date = extract_published_date(html);
+            let excerpt = extract_excerpt(html);
+
+            return ExtractionResult {
+                title: Some(product.title),
+                author,
+                published_date,
+                excerpt,
+                body_html: product.content,
+                body_text: product.text,
+                reading_time_minutes,
+                confidence,
+                thin_content,
+                extraction_failed: false,
+                method: "readability".to_string(),
+            };
         }
-        None => {
-            let fallback = fallback_css_extraction(html);
-            (None, fallback.0, fallback.1, "css_selector")
-        }
-    };
+    }
 
-    let non_ws_len = body_text.chars().filter(|c| !c.is_whitespace()).count();
-    let thin_content = non_ws_len < 200;
+    let css = try_css_selector_extraction(html);
+    let css_confidence = calculate_confidence(&css.body_html, &css.body_text, &full_text);
 
-    let word_count = body_text.split_whitespace().count();
-    let reading_time_minutes = if word_count == 0 {
-        0
-    } else {
-        ((word_count as f32 / 200.0).ceil() as u32).max(1)
-    };
+    if css_confidence >= 0.25 {
+        let non_ws_len = css.body_text.chars().filter(|c| !c.is_whitespace()).count();
+        let thin_content = non_ws_len < 200;
+        let word_count = css.body_text.split_whitespace().count();
+        let reading_time_minutes = if word_count == 0 {
+            0
+        } else {
+            ((word_count as f32 / 200.0).ceil() as u32).max(1)
+        };
+        let author = extract_author(html);
+        let published_date = extract_published_date(html);
+        let excerpt = extract_excerpt(html);
 
-    let confidence = if method == "readability" {
-        word_ratio(&body_text, &full_text).min(1.0)
-    } else {
-        0.5
-    };
-
-    let author = extract_author(html);
-    let published_date = extract_published_date(html);
-    let excerpt = extract_excerpt(html);
+        return ExtractionResult {
+            title: css.title,
+            author,
+            published_date,
+            excerpt,
+            body_html: css.body_html,
+            body_text: css.body_text,
+            reading_time_minutes,
+            confidence: css_confidence,
+            thin_content,
+            extraction_failed: false,
+            method: "css_selector".to_string(),
+        };
+    }
 
     ExtractionResult {
-        title,
-        author,
-        published_date,
-        excerpt,
-        body_html,
-        body_text,
-        reading_time_minutes,
-        confidence,
-        thin_content,
-        method,
+        title: extract_title_tag(html),
+        author: None,
+        published_date: None,
+        excerpt: None,
+        body_html: String::new(),
+        body_text: String::new(),
+        reading_time_minutes: 0,
+        confidence: 0.0,
+        thin_content: true,
+        extraction_failed: true,
+        method: "failed".to_string(),
     }
 }
 
-fn try_readability(html: &str, base_url: &str) -> Option<readability::extractor::Product> {
-    let parsed_url = Url::parse(base_url).ok()?;
-    let mut input = Cursor::new(html.as_bytes());
-    readability::extractor::extract(&mut input, &parsed_url).ok()
+fn text_to_tag_ratio(html: &str) -> f32 {
+    let mut in_tag = false;
+    let mut text_chars = 0usize;
+    let mut tag_chars = 0usize;
+    for c in html.chars() {
+        match c {
+            '<' => { in_tag = true; tag_chars += 1; }
+            '>' => { in_tag = false; tag_chars += 1; }
+            _ => if in_tag { tag_chars += 1; } else { text_chars += 1; }
+        }
+    }
+    let total = text_chars + tag_chars;
+    if total == 0 { return 0.0; }
+    text_chars as f32 / total as f32
 }
 
-fn fallback_css_extraction(html: &str) -> (String, String) {
+fn calculate_confidence(body_html: &str, body_text: &str, full_page_text: &str) -> f32 {
+    let ratio = text_to_tag_ratio(body_html);
+    let para_count = body_html.matches("<p").count();
+    let word_ratio = if full_page_text.is_empty() { 0.0 } else {
+        let extracted_words = body_text.split_whitespace().count();
+        let total_words = full_page_text.split_whitespace().count();
+        if total_words == 0 { 0.0 } else { extracted_words as f32 / total_words as f32 }
+    };
+
+    if ratio < 0.35 || para_count < 3 || word_ratio < 0.10 {
+        let failed = [ratio < 0.35, para_count < 3, word_ratio < 0.10]
+            .iter().filter(|&&x| x).count();
+        0.5 - (failed as f32 * 0.15)
+    } else {
+        (ratio * 0.4 + word_ratio * 0.4 + (para_count.min(10) as f32 / 10.0) * 0.2)
+            .min(1.0)
+    }
+}
+
+struct CssExtraction {
+    title: Option<String>,
+    body_html: String,
+    body_text: String,
+}
+
+fn try_css_selector_extraction(html: &str) -> CssExtraction {
     let document = Html::parse_document(html);
-    let html_content = select_and_sanitize_html(&document);
-    let text_content = select_and_sanitize_text(&document);
-    (html_content, text_content)
-}
+    let title = extract_title_tag(html);
 
-fn select_and_sanitize_html(document: &Html) -> String {
-    use crate::crawler::{sanitize_to_html, select_content};
-    let selectors = ["article".to_string(), "main".to_string(), "body".to_string()];
-    let matched = select_content(document, &selectors);
-    if matched.is_empty() {
-        return String::new();
+    let selectors_order: &[&str] = &[
+        "article",
+        "main",
+        "[role=\"main\"]",
+        ".content",
+        ".post",
+    ];
+
+    for selector_str in selectors_order {
+        if let Ok(sel) = Selector::parse(selector_str) {
+            let elements: Vec<_> = document.select(&sel).collect();
+            if elements.is_empty() {
+                continue;
+            }
+            use crate::crawler::sanitize_to_html;
+            let html_content = sanitize_to_html(&elements);
+            if !html_content.trim().is_empty() {
+                let text_content: String = elements.iter().flat_map(|e| e.text()).collect();
+                if !text_content.trim().is_empty() {
+                    return CssExtraction {
+                        title,
+                        body_html: html_content,
+                        body_text: text_content,
+                    };
+                }
+            }
+        }
     }
-    sanitize_to_html(&matched)
-}
 
-fn select_and_sanitize_text(document: &Html) -> String {
-    use crate::crawler::{sanitize_to_text, select_content};
-    let selectors = ["article".to_string(), "main".to_string(), "body".to_string()];
-    let matched = select_content(document, &selectors);
-    if matched.is_empty() {
-        return String::new();
+    CssExtraction {
+        title,
+        body_html: String::new(),
+        body_text: String::new(),
     }
-    sanitize_to_text(&matched)
 }
 
-fn extract_full_text(html: &str) -> String {
+fn extract_all_text(html: &str) -> String {
     let document = Html::parse_document(html);
     use crate::crawler::{sanitize_to_text, select_content};
     let matched = select_content(&document, &["body".to_string()]);
@@ -135,13 +213,64 @@ fn extract_full_text(html: &str) -> String {
     sanitize_to_text(&matched)
 }
 
-fn word_ratio(extracted: &str, full: &str) -> f32 {
-    let ext_words = extracted.split_whitespace().count() as f32;
-    let full_words = full.split_whitespace().count() as f32;
-    if full_words == 0.0 {
-        return 0.0;
+fn extract_title_tag(html: &str) -> Option<String> {
+    let document = Html::parse_document(html);
+    if let Ok(sel) = Selector::parse("title") {
+        if let Some(el) = document.select(&sel).next() {
+            let text: String = el.text().collect();
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
     }
-    ext_words / full_words
+    None
+}
+
+fn try_readability(html: &str, base_url: &str) -> Option<readability::extractor::Product> {
+    let parsed_url = Url::parse(base_url).ok()?;
+    let mut input = Cursor::new(html.as_bytes());
+    readability::extractor::extract(&mut input, &parsed_url).ok()
+}
+
+pub fn extract_published_date(html: &str) -> Option<String> {
+    let document = Html::parse_document(html);
+
+    if let Ok(sel) = Selector::parse("meta[property=\"article:published_time\"]") {
+        if let Some(el) = document.select(&sel).next() {
+            if let Some(content) = el.value().attr("content") {
+                if let Some(iso) = normalize_date(content.trim()) {
+                    return Some(iso);
+                }
+            }
+        }
+    }
+
+    if let Ok(sel) = Selector::parse("meta[name=\"pubdate\"]") {
+        if let Some(el) = document.select(&sel).next() {
+            if let Some(content) = el.value().attr("content") {
+                if let Some(iso) = normalize_date(content.trim()) {
+                    return Some(iso);
+                }
+            }
+        }
+    }
+
+    if let Ok(sel) = Selector::parse("time[datetime]") {
+        if let Some(el) = document.select(&sel).next() {
+            if let Some(dt) = el.value().attr("datetime") {
+                if let Some(iso) = normalize_date(dt.trim()) {
+                    return Some(iso);
+                }
+            }
+        }
+    }
+
+    if let Some(iso) = extract_ld_json_date(html) {
+        return Some(iso);
+    }
+
+    None
 }
 
 fn extract_author(html: &str) -> Option<String> {
@@ -195,46 +324,6 @@ fn extract_excerpt(html: &str) -> Option<String> {
                 }
             }
         }
-    }
-
-    None
-}
-
-pub fn extract_published_date(html: &str) -> Option<String> {
-    let document = Html::parse_document(html);
-
-    if let Ok(sel) = Selector::parse("meta[property=\"article:published_time\"]") {
-        if let Some(el) = document.select(&sel).next() {
-            if let Some(content) = el.value().attr("content") {
-                if let Some(iso) = normalize_date(content.trim()) {
-                    return Some(iso);
-                }
-            }
-        }
-    }
-
-    if let Ok(sel) = Selector::parse("meta[name=\"pubdate\"]") {
-        if let Some(el) = document.select(&sel).next() {
-            if let Some(content) = el.value().attr("content") {
-                if let Some(iso) = normalize_date(content.trim()) {
-                    return Some(iso);
-                }
-            }
-        }
-    }
-
-    if let Ok(sel) = Selector::parse("time[datetime]") {
-        if let Some(el) = document.select(&sel).next() {
-            if let Some(dt) = el.value().attr("datetime") {
-                if let Some(iso) = normalize_date(dt.trim()) {
-                    return Some(iso);
-                }
-            }
-        }
-    }
-
-    if let Some(iso) = extract_ld_json_date(html) {
-        return Some(iso);
     }
 
     None
