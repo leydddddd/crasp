@@ -14,8 +14,8 @@ use url::Url;
 
 use phf::phf_set;
 
-use crate::commands::TauriEmitter;
 use crate::commands::{persist_items_with_outcome, emit_persist_stages, SharedCrawlOutcomes};
+use crate::progress::CraspEmitter;
 use crate::logging::emit_log;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,7 +221,7 @@ impl Crawler {
     pub async fn run(
         self,
         config: CrawlConfig,
-        emitter: TauriEmitter,
+        emitter: CraspEmitter,
         control: &CrawlControl,
         crawl_id: &str,
         ctx: &Arc<crate::runtime::AppContext>,
@@ -267,10 +267,14 @@ impl Crawler {
         let mut worker_cancel_rx = control.cancel_rx();
         let worker_pause_rx = control.pause_rx();
 
+        let done_tx_shared: Arc<mpsc::Sender<WorkerOutput>> = Arc::new(done_tx);
+        let outstanding_tasks: Arc<std::sync::atomic::AtomicU32> = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
         let worker_loop = {
-            let done_tx = done_tx.clone();
+            let done_tx_shared = done_tx_shared.clone();
             let semaphore = semaphore.clone();
             let cancelled_flag = cancelled_flag.clone();
+            let outstanding = outstanding_tasks.clone();
 
             tokio::spawn(async move {
                 let mut rx = work_rx;
@@ -279,7 +283,9 @@ impl Crawler {
                         item = rx.recv() => {
                             match item {
                                 Some(i) => i,
-                                None => break,
+                                None => {
+                                    break;
+                                }
                             }
                         }
                         _ = worker_cancel_rx.changed() => {
@@ -303,12 +309,8 @@ impl Crawler {
                         break;
                     }
 
-                    // If paused, release the semaphore permit so other work
-                    // can proceed when we resume. Wait efficiently on both
-                    // the pause and cancel channels — no yield_now() spin.
                     let mut pause_rx = worker_pause_rx.clone();
                     if *pause_rx.borrow() {
-                        // Drop the permit while paused to free the slot.
                         drop(permit);
 
                         loop {
@@ -331,7 +333,6 @@ impl Crawler {
                             break;
                         }
 
-                        // Re-acquire the permit after resuming.
                         permit = match semaphore.clone().acquire_owned().await {
                             Ok(p) => p,
                             Err(_) => break,
@@ -345,15 +346,20 @@ impl Crawler {
                     let c = client.clone();
                     let cf = cfg_worker.clone();
                     let em = emitter_worker.clone();
-                    let tx = done_tx.clone();
+                    let tx = (*done_tx_shared).clone();
                     let cid = crawl_id_worker.clone();
+                    let out_count = outstanding.clone();
+
+                    out_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                     tokio::spawn(async move {
                         let _permit = permit;
                         let output = process_page(c, item, &cf, &em, &cid).await;
                         let _ = tx.send(output).await;
+                        out_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     });
                 }
+                drop(done_tx_shared);
             })
         };
 
@@ -369,6 +375,7 @@ impl Crawler {
 
         let collector = tokio::spawn(async move {
             while let Some(output) = done_rx.recv().await {
+
                 let archived = output.page.clone();
 
                 let _ = result_tx.send(archived.clone()).await;
@@ -422,15 +429,17 @@ impl Crawler {
                     }
                 }
             }
+
         });
 
         // ---- Channel lifetime invariants ----
-        // work_tx: dropped below. The collector holds inject_tx (a clone).
-        //          work_rx closes only after the collector also drops inject_tx.
-        // done_tx: each spawned worker holds a clone. done_rx closes only after
-        //          all workers exit. We drop our copy here.
+        // work_tx is dropped below. The collector holds inject_tx (a clone).
+        // When the main loop has collected all expected pages, it breaks out
+        // and aborts the worker_loop and collector tasks.
         drop(work_tx);
-        drop(done_tx);
+        drop(done_tx_shared);
+
+
 
         let mut results: Vec<ArchivedPage> = Vec::new();
         let emitter_result = emitter.clone();
@@ -442,8 +451,15 @@ impl Crawler {
         let crawl_id_owned = crawl_id.to_string();
         let app_data_dir_owned = app_data_dir.to_string();
         let ctx_result = ctx.clone();
+        let expected_results = pages_count.clone();
 
         loop {
+            if results.len() as u32 >= expected_results.load(std::sync::atomic::Ordering::SeqCst)
+                && outstanding_tasks.load(std::sync::atomic::Ordering::SeqCst) == 0
+            {
+                break;
+            }
+
             if *pause_rx.borrow() {
                 tokio::select! {
                     _ = pause_rx.changed() => {
@@ -496,6 +512,8 @@ impl Crawler {
             }
         }
 
+
+
         if !persist_buffer.is_empty() {
             let outcomes = persist_items_with_outcome(
                 &ctx_result,
@@ -507,6 +525,7 @@ impl Crawler {
             emit_persist_stages(&emitter_result, &crawl_id_owned, outcomes, shared_outcomes.as_ref()).await;
         }
 
+        let was_cancelled = cancelled.load(std::sync::atomic::Ordering::SeqCst);
         cancelled_flag.store(true, std::sync::atomic::Ordering::SeqCst);
 
         worker_loop.abort();
@@ -515,8 +534,7 @@ impl Crawler {
         let _ = worker_loop.await;
         let _ = collector.await;
 
-        let cancelled_flag_val = cancelled.load(std::sync::atomic::Ordering::SeqCst);
-        if cancelled_flag_val {
+        if was_cancelled {
             let _ = emit_log(&emitter, "warn", "local", &format!("Crawl cancelled: id={}", crawl_id));
         } else {
             let _ = emit_log(&emitter, "info", "local", &format!("Crawl completed: id={}, pages={}", crawl_id, results.len()));
@@ -530,7 +548,7 @@ async fn process_page(
     client: reqwest::Client,
     item: FrontierItem,
     config: &CrawlConfig,
-    emitter: &TauriEmitter,
+    emitter: &CraspEmitter,
     crawl_id: &str,
 ) -> WorkerOutput {
     let url_str = item.url.clone();
