@@ -3,8 +3,9 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-use crate::commands::{persist_items_with_outcome, emit_persist_stages, TauriEmitter, SharedCrawlOutcomes};
+use crate::commands::{persist_items_with_outcome, emit_persist_stages, SharedCrawlOutcomes};
 use crate::crawler::{CrawlConfig, CrawlControl, PageStage};
+use crate::progress::CraspEmitter;
 use crate::runtime::AppContext;
 
 fn config_to_args(config: &CrawlConfig, out_path: &str) -> Vec<String> {
@@ -37,7 +38,7 @@ fn config_to_args(config: &CrawlConfig, out_path: &str) -> Vec<String> {
 pub async fn run_local_spider_streaming(
     config: &CrawlConfig,
     out_path: &str,
-    emitter: &TauriEmitter,
+    emitter: &CraspEmitter,
     control: &Arc<CrawlControl>,
     ctx: &Arc<AppContext>,
     crawl_id: &str,

@@ -300,6 +300,67 @@ Indexes are created automatically by `ArchiveStore::ensure_indexes()` and mirror
 
 ---
 
+## CLI — `crasp-cli`
+
+A headless CLI binary that shares the exact same Rust library core as the Tauri desktop app. No logic is duplicated — the CLI is a second entry point into the same `crawler.rs`, `extraction.rs`, `export.rs`, `store.rs`, `zyte.rs`, and `ssrf.rs`.
+
+### Build
+
+```bash
+cargo build --bin crasp-cli --release
+# Binary at: src-tauri/target/release/crasp-cli.exe (Windows)
+#            src-tauri/target/release/crasp-cli    (macOS/Linux)
+```
+
+### Environment variables
+
+| Variable | Description |
+|---|---|
+| `CRASP_MONGO_URI` | MongoDB connection URI (e.g. `mongodb://localhost:27017`) |
+| `ZYTE_API_KEY` | Zyte API key for cloud crawling |
+| `CRASP_ZYTE_PROJECT` | Zyte Scrapy Cloud project ID |
+
+### Quick-start
+
+```bash
+# Validate a URL (SSRF check)
+crasp-cli validate https://example.com
+
+# Crawl a site
+crasp-cli crawl https://en.wikipedia.org/wiki/Web_scraping --max-pages 10 --max-depth 2
+
+# List archived crawls
+crasp-cli list
+
+# List pages for a crawl
+crasp-cli list crawl_1719234567890
+
+# Export as Markdown
+crasp-cli export --crawl-id crawl_1719234567890 --format md --scope one-file
+
+# Export as EPUB
+crasp-cli export --crawl-id crawl_1719234567890 --format epub --scope one-file
+
+# Test MongoDB connection
+crasp-cli status --mongo
+
+# Show data directory
+crasp-cli data-dir
+```
+
+### Subcommands
+
+| Command | Description |
+|---|---|
+| `crawl <URL>` | Crawl and archive pages. Options: `--max-pages`, `--max-depth`, `--concurrency`, `--selectors`, `--preserve-html`, `--hash-algorithm`, `--output`, `--engine` |
+| `list [CRAWL_ID]` | List crawls or pages. Options: `--format` (table/json/csv), `--status`, `--thin-only` |
+| `export` | Export archived content. Options: `--crawl-id`, `--url`, `--format` (txt/md/html/epub), `--scope` (page/one-file/folder), `--content`, `--output` |
+| `status` | Test connectivity. Options: `--mongo`, `--zyte` |
+| `data-dir` | Show app data directory and contents |
+| `validate <URL>` | SSRF-safe URL validation |
+
+---
+
 ## Tech stack
 
 - **Backend:** Rust, Tauri 2, Tokio, reqwest, scraper, sha2, md-5, dashmap,

@@ -50,6 +50,23 @@ pub struct ExportResult {
 }
 
 impl ExportRequest {
+    pub fn format_string(&self) -> String {
+        match self.format {
+            ExportFormat::PlainText => "plain_text".to_string(),
+            ExportFormat::Markdown => "markdown".to_string(),
+            ExportFormat::Html => "html".to_string(),
+            ExportFormat::Epub => "epub".to_string(),
+        }
+    }
+
+    pub fn scope_string(&self) -> String {
+        match self.scope {
+            ExportScope::SinglePage => "single_page".to_string(),
+            ExportScope::WholeCrawlOneFile => "whole_crawl_one_file".to_string(),
+            ExportScope::WholeCrawlFolder => "whole_crawl_folder".to_string(),
+        }
+    }
+
     pub fn is_valid(&self) -> Result<(), String> {
         match self.format {
             ExportFormat::Epub => {

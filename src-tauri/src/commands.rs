@@ -5,6 +5,7 @@ use std::sync::Arc;
 use futures_util::TryStreamExt;
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::progress::CraspEmitter;
 use crate::crawler::{CrawlConfig, Crawler, CrawlControl, PageStage, PersistTarget};
 use crate::logging::emit_log;
 use crate::runtime::{AppContext, ServiceState, AppStatus as StoreAppStatus};
@@ -250,7 +251,8 @@ pub async fn start_crawl(
     ctx: tauri::State<'_, Arc<AppContext>>,
 ) -> Result<(), String> {
     if let Err(e) = crate::ssrf::validate_seed_url(&config.seed_url).await {
-        let emitter = TauriEmitter::new(app);
+        let te = TauriEmitter::new(app);
+        let emitter = CraspEmitter::Tauri(te);
         let _ = emit_log(&emitter, "error", "system", &format!("SSRF validation rejected seed URL {}: {}", config.seed_url, e)).await;
         return Err(e);
     }
@@ -277,7 +279,7 @@ pub async fn start_crawl(
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| ".".to_string());
 
-    let emitter = TauriEmitter::new(app);
+    let emitter = CraspEmitter::Tauri(TauriEmitter::new(app));
     let control = new_control;
     let ctx_arc = ctx.inner().clone();
 
@@ -321,7 +323,8 @@ pub async fn start_cloud_crawl(
     ctx: tauri::State<'_, Arc<AppContext>>,
 ) -> Result<(), String> {
     if let Err(e) = crate::ssrf::validate_seed_url(&config.seed_url).await {
-        let emitter = TauriEmitter::new(app);
+        let te = TauriEmitter::new(app);
+        let emitter = CraspEmitter::Tauri(te);
         let _ = emit_log(&emitter, "error", "system", &format!("SSRF validation rejected seed URL {}: {}", config.seed_url, e)).await;
         return Err(e);
     }
@@ -367,7 +370,7 @@ pub async fn start_cloud_crawl(
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| ".".to_string());
 
-    let emitter = TauriEmitter::new(app);
+    let emitter = CraspEmitter::Tauri(TauriEmitter::new(app));
     let ctx_arc = ctx.inner().clone();
 
     let _ = emit_log(&emitter, "info", "cloud", &format!("Cloud crawl started: id={}, seed={}", crawl_id, config.seed_url));
@@ -550,7 +553,7 @@ pub async fn start_cloud_crawl(
 }
 
 pub async fn emit_persist_stages(
-    emitter: &TauriEmitter,
+    emitter: &CraspEmitter,
     crawl_id: &str,
     outcomes: Vec<(serde_json::Value, PersistOutcome)>,
     shared: Option<&Arc<SharedCrawlOutcomes>>,
@@ -626,7 +629,8 @@ pub async fn local_scrapy_crawl(
     ctx: tauri::State<'_, Arc<AppContext>>,
 ) -> Result<(), String> {
     if let Err(e) = crate::ssrf::validate_seed_url(&config.seed_url).await {
-        let emitter = TauriEmitter::new(app);
+        let te = TauriEmitter::new(app);
+        let emitter = CraspEmitter::Tauri(te);
         let _ = emit_log(&emitter, "error", "system", &format!("SSRF validation rejected seed URL {}: {}", config.seed_url, e)).await;
         return Err(e);
     }
@@ -656,7 +660,7 @@ pub async fn local_scrapy_crawl(
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| ".".to_string());
 
-    let emitter = TauriEmitter::new(app);
+    let emitter = CraspEmitter::Tauri(TauriEmitter::new(app));
 
     let _ = emit_log(&emitter, "info", "local-scrapy", &format!("Local-Scrapy crawl started: id={}, seed={}", crawl_id, config.seed_url));
 
@@ -1681,25 +1685,6 @@ pub async fn export_content(
                     }
                 }
             }
-        }
-    }
-}
-
-impl crate::export::ExportRequest {
-    fn format_string(&self) -> String {
-        match self.format {
-            crate::export::ExportFormat::PlainText => "plain_text".to_string(),
-            crate::export::ExportFormat::Markdown => "markdown".to_string(),
-            crate::export::ExportFormat::Html => "html".to_string(),
-            crate::export::ExportFormat::Epub => "epub".to_string(),
-        }
-    }
-
-    fn scope_string(&self) -> String {
-        match self.scope {
-            crate::export::ExportScope::SinglePage => "single_page".to_string(),
-            crate::export::ExportScope::WholeCrawlOneFile => "whole_crawl_one_file".to_string(),
-            crate::export::ExportScope::WholeCrawlFolder => "whole_crawl_folder".to_string(),
         }
     }
 }

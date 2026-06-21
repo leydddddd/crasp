@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::commands::TauriEmitter;
+use crate::progress::CraspEmitter;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
@@ -11,7 +11,7 @@ pub struct LogEntry {
 }
 
 pub fn emit_log(
-    emitter: &TauriEmitter,
+    emitter: &CraspEmitter,
     level: &str,
     engine: &str,
     message: &str,
