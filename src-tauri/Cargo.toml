@@ -7,6 +7,14 @@ edition = "2021"
 name = "crasp_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[[bin]]
+name = "crasp"
+path = "src/main.rs"
+
+[[bin]]
+name = "crasp-cli"
+path = "src/cli_main.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -35,6 +43,10 @@ futures-util = "0.3"
 readability = { version = "0.3", default-features = false }
 epub-builder = "0.7"
 mime_guess = "2"
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.17"
+colored = "2"
+csv = "1"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(mobile)"] }

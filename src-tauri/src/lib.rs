@@ -1,14 +1,15 @@
 pub mod commands;
 pub mod crawler;
 pub mod extraction;
-mod local_scrapy;
-mod logging;
+pub mod local_scrapy;
+pub mod logging;
+pub mod progress;
 pub mod runtime;
-mod schema;
+pub mod schema;
 pub mod ssrf;
-mod store;
+pub mod store;
+pub mod zyte;
 pub mod export;
-mod zyte;
 
 use std::sync::Arc;
 
