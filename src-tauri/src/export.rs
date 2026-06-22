@@ -577,28 +577,29 @@ fn html_to_xhtml(html: &str) -> String {
 fn strip_scripts_and_styles(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let lower = s.to_ascii_lowercase();
-    let mut i = 0;
-    let bytes = s.as_bytes();
-    while i < bytes.len() {
-        let remaining = &lower[i..];
-        if remaining.starts_with("<script") {
-            if let Some(end) = lower[i..].find("</script>") {
-                i += end + 9;
+    let lower_bytes = lower.as_bytes();
+    let src_bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < src_bytes.len() {
+        if lower_bytes[i..].starts_with(b"<script") {
+            if let Some(end) = lower_bytes[i..].windows(b"</script>".len()).position(|w| w == b"</script>") {
+                i += end + b"</script>".len();
                 continue;
             } else {
                 break;
             }
         }
-        if remaining.starts_with("<style") {
-            if let Some(end) = lower[i..].find("</style>") {
-                i += end + 8;
+        if lower_bytes[i..].starts_with(b"<style") {
+            if let Some(end) = lower_bytes[i..].windows(b"</style>".len()).position(|w| w == b"</style>") {
+                i += end + b"</style>".len();
                 continue;
             } else {
                 break;
             }
         }
-        result.push(bytes[i] as char);
-        i += 1;
+        let ch = s[i..].chars().next().unwrap_or('\0');
+        result.push(ch);
+        i += ch.len_utf8();
     }
     result
 }
@@ -616,68 +617,48 @@ fn self_close_void_elements(s: &str) -> String {
 }
 
 fn fix_void_element(html: &str, tag: &str) -> String {
-    let open = format!("<{}", tag);
+    let open_lower = format!("<{}", tag).to_ascii_lowercase();
+    let lower: String = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len());
-    let mut pos = 0;
-    while pos < html.len() {
-        if html[pos..].to_ascii_lowercase().starts_with(&open) {
-            if let Some(end) = html[pos..].find('>') {
-                let tag_slice = &html[pos..pos + end + 1];
+    let mut pos = 0usize;
+    let html_bytes = html.as_bytes();
+    let lower_bytes = lower.as_bytes();
+    let open_bytes = open_lower.as_bytes();
+    while pos < html_bytes.len() {
+        if lower_bytes[pos..].starts_with(open_bytes) {
+            if let Some(end) = html_bytes[pos..].iter().position(|&b| b == b'>') {
+                let tag_slice_end = pos + end + 1;
+                let tag_slice = &html[pos..tag_slice_end];
                 if !tag_slice.ends_with("/>") {
                     out.push_str(&html[pos..pos + end]);
                     out.push_str(" />");
                 } else {
                     out.push_str(tag_slice);
                 }
-                pos += end + 1;
+                pos = tag_slice_end;
                 continue;
             }
         }
-        out.push(html.as_bytes()[pos] as char);
-        pos += 1;
+        let ch = html[pos..].chars().next().unwrap_or('\0');
+        out.push(ch);
+        pos += ch.len_utf8();
     }
     out
 }
 
 fn escape_bare_ampersands(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '&' {
-            let mut entity = String::new();
-            let mut found_semi = false;
-            let mut lookahead: Vec<char> = Vec::new();
-            while let Some(&nc) = chars.peek() {
-                if nc == ';' {
-                    lookahead.push(chars.next().unwrap());
-                    found_semi = true;
-                    break;
-                } else if nc.is_whitespace() || nc == '<' || nc == '>' || nc == '&' {
-                    break;
-                } else if entity.len() > 8 {
-                    break;
-                } else {
-                    lookahead.push(chars.next().unwrap());
-                    entity.push(nc);
-                }
-            }
-            let is_valid_entity = found_semi && (
-                matches!(entity.as_str(), "amp" | "lt" | "gt" | "quot" | "apos")
-                || entity.starts_with('#')
-            );
-            if is_valid_entity {
-                out.push('&');
-                out.push_str(&entity);
-                out.push(';');
-            } else {
-                out.push_str("&amp;");
-                for lc in lookahead { out.push(lc); }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    let s = s
+        .replace("&",  "\x00AMP\x00")
+        .replace("<",   "\x00LT\x00")
+        .replace(">",   "\x00GT\x00")
+        .replace("&#",  "\x00HASH\x00");
+
+    let s = s.replace('&', "&");
+
+    s.replace("\x00AMP\x00",  "&")
+     .replace("\x00LT\x00",   "<")
+     .replace("\x00GT\x00",   ">")
+     .replace("\x00HASH\x00", "&#")
 }
 
 // =============================================================================

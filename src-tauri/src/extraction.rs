@@ -138,21 +138,45 @@ fn text_to_tag_ratio(html: &str) -> f32 {
     text_chars as f32 / total as f32
 }
 
+fn link_density_ratio(html: &str) -> f32 {
+    let href_count = html.matches("href=").count();
+    let para_count = html.matches("</p>").count();
+
+    if para_count == 0 {
+        return if href_count > 0 { 1.0 } else { 0.0 };
+    }
+
+    href_count as f32 / (href_count + para_count) as f32
+}
+
 fn calculate_confidence(body_html: &str, body_text: &str, full_page_text: &str) -> f32 {
     let ratio = text_to_tag_ratio(body_html);
     let para_count = body_html.matches("<p").count();
+    let close_para_count = body_html.matches("</p>").count();
     let word_ratio = if full_page_text.is_empty() { 0.0 } else {
         let extracted_words = body_text.split_whitespace().count();
         let total_words = full_page_text.split_whitespace().count();
         if total_words == 0 { 0.0 } else { extracted_words as f32 / total_words as f32 }
     };
+    let link_density = link_density_ratio(body_html);
 
-    if ratio < 0.35 || para_count < 3 || word_ratio < 0.10 {
-        let failed = [ratio < 0.35, para_count < 3, word_ratio < 0.10]
-            .iter().filter(|&&x| x).count();
+    let low_confidence = ratio < 0.35
+        || close_para_count < 5
+        || word_ratio < 0.10
+        || link_density > 0.95;
+
+    if low_confidence {
+        let failed = [
+            ratio < 0.35,
+            close_para_count < 5,
+            word_ratio < 0.10,
+            link_density > 0.95,
+        ].iter().filter(|&&x| x).count();
         0.5 - (failed as f32 * 0.15)
     } else {
-        (ratio * 0.4 + word_ratio * 0.4 + (para_count.min(10) as f32 / 10.0) * 0.2)
+        (ratio * 0.35 + word_ratio * 0.35
+         + (para_count.min(10) as f32 / 10.0) * 0.15
+         + (1.0 - link_density) * 0.15)
             .min(1.0)
     }
 }
