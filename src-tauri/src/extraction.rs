@@ -16,7 +16,20 @@ pub struct ExtractionResult {
     pub confidence: f32,
     pub thin_content: bool,
     pub extraction_failed: bool,
-    method: String,
+    pub method: String,
+}
+
+pub struct ZyteExtractionResult {
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub published_date: Option<String>,
+    pub excerpt: Option<String>,
+    pub body_html: String,
+    pub body_text: String,
+    pub reading_time_minutes: u32,
+    pub confidence: f32,
+    pub method: String,
+    pub thin_content: bool,
 }
 
 impl ExtractionResult {

@@ -23,6 +23,7 @@ import {
   X,
   AlertTriangle,
   FileDown,
+  Zap,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useArchiver } from "@/hooks/useArchiver";
@@ -83,6 +84,23 @@ function sourceBadge(source: StorageSource): React.ReactNode {
     );
   }
   return null;
+}
+
+function extractionMethodBadge(method: string | null): React.ReactNode {
+  if (!method) return null;
+  switch (method) {
+    case "readability":
+      return <span className="rounded px-1 py-0.5 text-[9px] bg-blue-900/30 text-blue-400 font-medium">readability</span>;
+    case "css_selector":
+      return <span className="rounded px-1 py-0.5 text-[9px] bg-gray-700/50 text-gray-300 font-medium">css_selector</span>;
+    case "zyte_autoextract":
+      return <span className="inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[9px] bg-emerald-900/30 text-emerald-400 font-medium"><Zap className="h-2.5 w-2.5" />Zyte</span>;
+    case "failed":
+    case "raw":
+      return <span className="rounded px-1 py-0.5 text-[9px] bg-amber-900/30 text-amber-400 font-medium">{method}</span>;
+    default:
+      return <span className="rounded px-1 py-0.5 text-[9px] bg-gray-700/50 text-gray-400 font-medium">{method}</span>;
+  }
 }
 
 export function ArchiverDashboard() {
@@ -567,6 +585,7 @@ export function ArchiverDashboard() {
               onSelectPage={setSelectedArchivePage}
               onExportPage={(page) => openExportPanel("single_page", page)}
               onExportCrawl={(crawlId) => openExportPanel("whole_crawl", null, crawlId)}
+              zyteAvailable={archiver.appStatus?.zyte_available === true}
             />
             <ExportPanel
               open={exportPanelOpen}
@@ -859,9 +878,26 @@ function DetailDrawer({
         </div>
       )}
       {page.thin_content && (
-        <div className="mx-4 mb-3 flex items-center gap-1.5 rounded-md bg-amber-900/20 px-2.5 py-1.5 text-xs text-amber-400 border border-amber-800/40">
-          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-          <span>Thin content — JS rendering may be needed</span>
+        <div className="mx-4 mb-3 flex items-center gap-2">
+          <div className="flex items-center gap-1.5 rounded-md bg-amber-900/20 px-2.5 py-1.5 text-xs text-amber-400 border border-amber-800/40">
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+            <span>Thin content — JS rendering may be needed</span>
+          </div>
+          {page.deep_fetched && (
+            <span className="inline-flex items-center gap-1 rounded-md bg-emerald-900/20 px-2.5 py-1.5 text-xs text-emerald-400 border border-emerald-800/40">
+              <CheckCircle2 className="h-3.5 w-3.5" />
+              Deep Fetched
+            </span>
+          )}
+        </div>
+      )}
+      {page.extraction_method && (
+        <div className="mx-4 mb-3 flex items-center gap-2 text-xs">
+          <span className="text-gray-500">Extraction:</span>
+          {extractionMethodBadge(page.extraction_method)}
+          {page.extraction_confidence != null && (
+            <span className="text-gray-600">confidence: {(page.extraction_confidence * 100).toFixed(0)}%</span>
+          )}
         </div>
       )}
       {stageLabel && (
@@ -904,6 +940,7 @@ function CrawlSummaryPanel({
     cancelled: boolean;
     crawl_id: string;
     storage_used: StorageUsed | null;
+    deep_fetched_count: number;
   };
   onDismiss: () => void;
   onOpenDataFolder: () => void;
@@ -945,6 +982,12 @@ function CrawlSummaryPanel({
       <div className="mb-3 text-xs">
         <span className="text-gray-500">Data stored in:</span>{" "}
         <span className="text-crasp-400 font-medium">{storageLabel}</span>
+        {summary.deep_fetched_count > 0 && (
+          <>
+            {" "}&middot;{" "}
+            <span className="text-emerald-400">Deep fetched: {summary.deep_fetched_count} pages via Zyte</span>
+          </>
+        )}
       </div>
       <div className="flex items-center gap-2">
         <button
@@ -1098,6 +1141,7 @@ function ArchiveViewer({
   onSelectPage,
   onExportPage,
   onExportCrawl,
+  zyteAvailable,
 }: {
   pages: PageSummary[];
   loading: boolean;
@@ -1105,37 +1149,26 @@ function ArchiveViewer({
   onSelectPage: (p: PageSummary | null) => void;
   onExportPage: (page: PageSummary) => void;
   onExportCrawl: (crawlId: string) => void;
+  zyteAvailable: boolean;
 }) {
   const [previewPage, setPreviewPage] = useState<PageSummary | null>(null);
   const [previewContent, setPreviewContent] = useState<string | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
+  const [deepFetchingUrl, setDeepFetchingUrl] = useState<string | null>(null);
 
-  const assetCounts = useMemo(() => {
-    let images = 0;
-    let documents = 0;
-    let pagesWithAssets = 0;
-    for (const p of pages) {
-      if (p.assets && (p.assets.images.length > 0 || p.assets.documents.length > 0)) {
-        images += p.assets.images.length;
-        documents += p.assets.documents.length;
-        pagesWithAssets++;
-      }
+  const handleDeepFetch = useCallback(async (page: PageSummary) => {
+    setDeepFetchingUrl(page.url);
+    try {
+      await invoke("deep_fetch_page", {
+        url: page.url,
+        crawlId: page.source === "Mongo" ? "" : "",
+      });
+    } catch (e) {
+      console.error("Deep fetch failed:", e);
+    } finally {
+      setDeepFetchingUrl(null);
     }
-    return { images, documents, pagesWithAssets };
-  }, [pages]);
-
-  const crawlIds = useMemo(() => {
-    const ids = new Map<string, number>();
-    for (const p of pages) {
-      const cid = (p as unknown as Record<string, unknown>).crawl_id as string | null;
-      if (cid) {
-        ids.set(cid, (ids.get(cid) || 0) + 1);
-      }
-    }
-    return ids;
-  }, [pages]);
-
-
+  }, []);
 
   const handlePreview = useCallback(async (page: PageSummary) => {
     if (previewPage?.url === page.url) {
@@ -1224,6 +1257,7 @@ function ArchiveViewer({
               <th className="px-3 py-2 text-right">Depth</th>
               <th className="px-3 py-2 text-left">Status</th>
               <th className="px-3 py-2 text-left">Source</th>
+              <th className="px-3 py-2 text-left">Method</th>
               <th className="px-3 py-2 text-right">Size</th>
               <th className="px-3 py-2 text-left">Timestamp</th>
               <th className="px-3 py-2 text-right">Export</th>
@@ -1259,6 +1293,16 @@ function ArchiveViewer({
                 <td className="px-3 py-2">
                   {sourceBadge(page.source)}
                 </td>
+                <td className="px-3 py-2">
+                  <div className="flex items-center gap-1">
+                    {extractionMethodBadge(page.extraction_method)}
+                    {page.deep_fetched && (
+                      <span className="inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[9px] bg-emerald-900/20 text-emerald-400">
+                        <CheckCircle2 className="h-2.5 w-2.5" />
+                      </span>
+                    )}
+                  </div>
+                </td>
                 <td className="px-3 py-2 text-right text-gray-500">
                   {page.content_size > 1024 ? `${(page.content_size / 1024).toFixed(1)} KB` : `${page.content_size} B`}
                 </td>
@@ -1267,6 +1311,16 @@ function ArchiveViewer({
                 </td>
                 <td className="px-3 py-2 text-right">
                   <div className="flex items-center justify-end gap-1">
+                    {page.thin_content && zyteAvailable && !page.deep_fetched && (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); handleDeepFetch(page); }}
+                        disabled={deepFetchingUrl === page.url}
+                        className="rounded px-1 py-0.5 text-[10px] bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600/30 transition-colors disabled:opacity-50"
+                        title="Deep fetch with Zyte browser rendering"
+                      >
+                        {deepFetchingUrl === page.url ? <Loader2 className="h-3 w-3 animate-spin" /> : <Zap className="h-3 w-3" />}
+                      </button>
+                    )}
                     <button
                       onClick={(e) => { e.stopPropagation(); handlePreview(page); }}
                       className="rounded px-1 py-0.5 text-[10px] bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-gray-200 transition-colors"

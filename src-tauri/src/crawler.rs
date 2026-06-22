@@ -105,6 +105,7 @@ pub struct ArchivedPage {
     pub extraction_method: Option<String>,
     pub extraction_confidence: Option<f32>,
     pub thin_content: Option<bool>,
+    pub deep_fetched: Option<bool>,
 }
 
 #[allow(dead_code)]
@@ -214,7 +215,6 @@ pub struct Crawler {
 impl Crawler {
     pub fn new() -> Self {
         let client = crate::ssrf::build_safe_http_client();
-
         Self { client }
     }
 
@@ -480,7 +480,13 @@ impl Crawler {
             tokio::select! {
                 page = result_rx.recv() => {
                     match page {
-                        Some(p) => {
+                        Some(mut p) => {
+                            if p.thin_content == Some(true)
+                                && ctx.deep_fetch_config.enabled
+                                && ctx.deep_fetch_config.auto_trigger
+                            {
+                                p = run_deep_fetch_if_available(p, &ctx, &emitter_result).await;
+                            }
                             let _ = emitter_result.emit("archive-success", &serde_json::to_value(&p).unwrap_or_default()).await;
                             results.push(p.clone());
                             persist_buffer.push(serde_json::to_value(&p).unwrap_or_default());
@@ -576,6 +582,7 @@ async fn process_page(
         extraction_method: None,
         extraction_confidence: None,
         thin_content: None,
+        deep_fetched: None,
     };
 
     let _ = emitter.emit("scrape-progress", &serde_json::json!({
@@ -806,6 +813,123 @@ async fn process_page(
         page,
         found_links: links,
     }
+}
+
+async fn run_deep_fetch_if_available(
+    mut page: ArchivedPage,
+    ctx: &Arc<crate::runtime::AppContext>,
+    emitter: &CraspEmitter,
+) -> ArchivedPage {
+    match ctx.deep_fetch_queue.acquire().await {
+        Ok(_permit) => {
+            let _ = emit_log(
+                emitter,
+                "info",
+                "local",
+                &format!(
+                    "Deep fetch triggered for {} (thin content: {} chars)",
+                    page.url,
+                    page.body_text.as_deref().unwrap_or("").len()
+                ),
+            )
+            .await;
+
+            match ctx.zyte.as_ref() {
+                Some(zyte_client) => match zyte_client.deep_fetch(&page.url, &ctx.http).await {
+                    Ok(result) => {
+                        let extraction =
+                            if let Some(ref article) = result.article {
+                                crate::zyte::zyte_article_to_extraction(
+                                    article,
+                                    &result.browser_html,
+                                    &page.url,
+                                )
+                            } else {
+                                tokio::task::spawn_blocking({
+                                    let html = result.browser_html.clone();
+                                    let url = page.url.clone();
+                                    move || {
+                                        let er = crate::extraction::extract_main_content(
+                                            &html, &url,
+                                        );
+                                        crate::extraction::ZyteExtractionResult {
+                                            title: er.title,
+                                            author: er.author,
+                                            published_date: er.published_date,
+                                            excerpt: er.excerpt,
+                                            body_html: er.body_html,
+                                            body_text: er.body_text,
+                                            reading_time_minutes: er.reading_time_minutes,
+                                            confidence: er.confidence,
+                                            method: er.method.clone(),
+                                            thin_content: er.thin_content,
+                                        }
+                                    }
+                                })
+                                .await
+                                .unwrap_or_else(|_| crate::extraction::ZyteExtractionResult {
+                                    title: None,
+                                    author: None,
+                                    published_date: None,
+                                    excerpt: None,
+                                    body_html: String::new(),
+                                    body_text: String::new(),
+                                    reading_time_minutes: 0,
+                                    confidence: 0.0,
+                                    method: "failed".to_string(),
+                                    thin_content: true,
+                                })
+                            };
+
+                        page.body_html = if !extraction.body_html.is_empty() {
+                            Some(extraction.body_html)
+                        } else {
+                            page.body_html
+                        };
+                        page.body_text = if !extraction.body_text.is_empty() {
+                            Some(extraction.body_text)
+                        } else {
+                            page.body_text
+                        };
+                        page.extraction_method = Some(extraction.method);
+                        page.extraction_confidence = Some(extraction.confidence);
+                        page.thin_content = Some(extraction.thin_content);
+                        page.author = page.author.or(extraction.author);
+                        page.published_date = page.published_date.or(extraction.published_date);
+                        page.deep_fetched = Some(true);
+                    }
+                    Err(e) => {
+                        let _ = emit_log(
+                            emitter,
+                            "warn",
+                            "local",
+                            &format!("Deep fetch failed for {}: {}", page.url, e),
+                        )
+                        .await;
+                    }
+                },
+                None => {
+                    let _ = emit_log(
+                        emitter,
+                        "warn",
+                        "local",
+                        "Deep fetch triggered but Zyte not configured — skipping",
+                    )
+                    .await;
+                }
+            }
+        }
+        Err(e) => {
+            let _ = emit_log(
+                emitter,
+                "warn",
+                "local",
+                &format!("Deep fetch skipped for {}: {}", page.url, e),
+            )
+            .await;
+        }
+    }
+    page
 }
 
 fn extract_title(document: &Html) -> String {

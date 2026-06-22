@@ -294,6 +294,7 @@ pub async fn persist_items(
             extraction_method: item.get("extraction_method").and_then(|v| v.as_str()).map(String::from),
             extraction_confidence: item.get("extraction_confidence").and_then(|v| v.as_f64()).map(|v| v as f32),
             thin_content: item.get("thin_content").and_then(|v| v.as_bool()),
+            deep_fetched: item.get("deep_fetched").and_then(|v| v.as_bool()),
         };
         pages.push(page);
 

@@ -112,6 +112,21 @@ enum Commands {
     Validate {
         url: String,
     },
+
+    #[command(about = "Deep fetch a single URL using Zyte browser rendering")]
+    DeepFetch {
+        #[arg(long, help = "URL to deep fetch")]
+        url: String,
+
+        #[arg(long, help = "Crawl ID to update the page record in")]
+        crawl_id: Option<String>,
+    },
+
+    #[command(about = "Test Zyte API browser rendering access")]
+    TestZyteApi {
+        #[arg(long, default_value = "https://example.com", help = "URL to test with")]
+        url: String,
+    },
 }
 
 fn app_data_dir() -> PathBuf {
@@ -340,6 +355,7 @@ async fn run_crawl(
                 extraction_method: None,
                 extraction_confidence: None,
                 thin_content: None,
+                deep_fetched: None,
             }).collect::<Vec<_>>()
         })
     } else {
@@ -444,6 +460,7 @@ async fn run_list(
                     extraction_method: doc.extraction_method.clone(),
                     extraction_confidence: doc.extraction_confidence,
                     thin_content: doc.thin_content,
+                    deep_fetched: doc.deep_fetched,
                 });
             }
         }
@@ -499,21 +516,23 @@ async fn run_list(
         }
         "csv" => {
             let mut wtr = csv::Writer::from_writer(std::io::stdout());
-            let _ = wtr.write_record(["url", "title", "depth", "status", "chars", "thin", "timestamp"]);
+            let _ = wtr.write_record(["url", "title", "depth", "status", "chars", "thin", "deep", "timestamp"]);
             for p in &pages {
                 let thin = p.thin_content.map(|b| if b { "true" } else { "false" }).unwrap_or("");
-                let _ = wtr.write_record([&p.url, &p.title, &p.depth.to_string(), &p.stage, &p.content_size.to_string(), thin, &p.timestamp]);
+                let deep = p.deep_fetched.map(|b| if b { "true" } else { "false" }).unwrap_or("");
+                let _ = wtr.write_record([&p.url, &p.title, &p.depth.to_string(), &p.stage, &p.content_size.to_string(), thin, deep, &p.timestamp]);
             }
             let _ = wtr.flush();
         }
         _ => {
             if crawl_id.is_some() {
-                println!("{:<60} {:<12} {:<6} {:<7} {:<5}", "URL", "STATUS", "DEPTH", "CHARS", "THIN");
+                println!("{:<60} {:<12} {:<6} {:<7} {:<5} {:<5}", "URL", "STATUS", "DEPTH", "CHARS", "THIN", "DEEP");
                 for p in &pages {
                     let url_display = if p.url.len() > 57 { format!("{}...", &p.url[..57]) } else { p.url.clone() };
                     let thin_mark = if p.thin_content == Some(true) { "⚠".to_string() } else { String::new() };
+                    let deep_mark = if p.deep_fetched == Some(true) { "✓".to_string() } else { String::new() };
                     let chars = if p.content_size > 0 { p.content_size.to_string() } else { "-".to_string() };
-                    println!("{:<60} {:<12} {:<6} {:<7} {:<5}", url_display, p.stage, p.depth, chars, thin_mark);
+                    println!("{:<60} {:<12} {:<6} {:<7} {:<5} {:<5}", url_display, p.stage, p.depth, chars, thin_mark, deep_mark);
                 }
             } else {
                 let dir = data_dir.clone();
@@ -902,6 +921,7 @@ async fn load_page_docs_for_export(ctx: &Arc<crasp_lib::runtime::AppContext>, cr
                         extraction_method: item.get("extraction_method").and_then(|v| v.as_str()).map(String::from),
                         extraction_confidence: item.get("extraction_confidence").and_then(|v| v.as_f64()).map(|v| v as f32),
                         thin_content: item.get("thin_content").and_then(|v| v.as_bool()),
+                        deep_fetched: item.get("deep_fetched").and_then(|v| v.as_bool()),
                     });
                 }
             }
@@ -1089,6 +1109,137 @@ async fn run_validate(url: &str) -> i32 {
     }
 }
 
+async fn run_deep_fetch(cli: &Cli, url: &str, crawl_id: Option<&str>) -> i32 {
+    if let Err(e) = crasp_lib::ssrf::validate_seed_url(url).await {
+        eprintln!("{} Rejected — {}", "✗".red().bold(), e);
+        return 1;
+    }
+
+    let ctx = build_app_context(cli.mongo_uri.clone()).await;
+
+    let zyte = match &ctx.zyte {
+        Some(c) => c,
+        None => {
+            eprintln!("{} ZYTE_API_KEY not configured", "✗".red().bold());
+            return 1;
+        }
+    };
+
+    if !ctx.deep_fetch_config.enabled {
+        eprintln!("{} Deep fetch not enabled — set CRASP_DEEP_FETCH_ENABLED=true", "⚠".yellow());
+    }
+
+    eprintln!("{} Deep fetching {}...", "→".blue(), url);
+
+    let _permit = match ctx.deep_fetch_queue.acquire().await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{} Rate limit: {}", "✗".red().bold(), e);
+            return 1;
+        }
+    };
+
+    match zyte.deep_fetch(url, &ctx.http).await {
+        Ok(result) => {
+            let extraction = if let Some(ref article) = result.article {
+                crasp_lib::zyte::zyte_article_to_extraction(article, &result.browser_html, url)
+            } else {
+                let er = crasp_lib::extraction::extract_main_content(&result.browser_html, url);
+                crasp_lib::extraction::ZyteExtractionResult {
+                    title: er.title,
+                    author: er.author,
+                    published_date: er.published_date,
+                    excerpt: er.excerpt,
+                    body_html: er.body_html,
+                    body_text: er.body_text,
+                    reading_time_minutes: er.reading_time_minutes,
+                    confidence: er.confidence,
+                    method: er.method.clone(),
+                    thin_content: er.thin_content,
+                }
+            };
+
+            if let Some(cid) = crawl_id {
+                if let Some(store) = &ctx.store {
+                    let filter = mongodb::bson::doc! { "url": url, "crawl_id": cid };
+                    let update = mongodb::bson::doc! {
+                        "$set": {
+                            "body_html": &extraction.body_html,
+                            "body_text": &extraction.body_text,
+                            "extraction_method": &extraction.method,
+                            "extraction_confidence": extraction.confidence,
+                            "thin_content": extraction.thin_content,
+                            "deep_fetched": true,
+                        }
+                    };
+                    let options = mongodb::options::UpdateOptions::builder().build();
+                    let _ = store.pages_col().update_one(filter, update).with_options(options).await;
+                }
+            }
+
+            println!("{} Deep fetch complete", "✓".green().bold());
+            println!("  Method:     {}", extraction.method);
+            println!("  Confidence: {:.2}", extraction.confidence);
+            println!("  Thin:       {}", extraction.thin_content);
+            println!("  Body text:  {} chars", extraction.body_text.len());
+            println!("  Body HTML:  {} chars", extraction.body_html.len());
+            println!("  Headline:   {}", extraction.title.as_deref().unwrap_or("(none)"));
+            println!("  Author:     {}", extraction.author.as_deref().unwrap_or("(none)"));
+            if result.article.is_some() {
+                println!("  AutoExtract: yes (structured article data)");
+            } else {
+                println!("  AutoExtract: no (readability fallback on browserHtml)");
+            }
+
+            0
+        }
+        Err(e) => {
+            eprintln!("{} Deep fetch failed: {}", "✗".red().bold(), e);
+            1
+        }
+    }
+}
+
+async fn run_test_zyte_api(cli: &Cli, test_url: &str) -> i32 {
+    println!("{} Testing Zyte API access...", "→".blue());
+
+    let ctx = build_app_context(cli.mongo_uri.clone()).await;
+
+    let zyte = match &ctx.zyte {
+        Some(c) => c,
+        None => {
+            eprintln!("{} ZYTE_API_KEY not configured", "✗".red().bold());
+            return 1;
+        }
+    };
+
+    match zyte.deep_fetch(test_url, &ctx.http).await {
+        Ok(result) => {
+            println!("{} Zyte API access confirmed!", "✓".green().bold());
+            println!("  Status code: {}", result.status_code);
+            println!("  Browser HTML: {} chars", result.browser_html.len());
+            if result.article.is_some() {
+                println!("  AutoExtract: available");
+            } else {
+                println!("  AutoExtract: not available for this URL");
+            }
+            println!("  WI-35-B path: Zyte API (browserHtml + AutoExtract)");
+            0
+        }
+        Err(e) => {
+            if e.contains("403") || e.contains("402") {
+                eprintln!("{} Zyte API unavailable ({}): WI-35-B-alt path required", "⚠".yellow(), e.trim());
+                println!("  → Scrapy Cloud spider fallback will be used for JS rendering");
+            } else if e.contains("401") {
+                eprintln!("{} Unauthorized ({}): check ZYTE_API_KEY", "✗".red().bold(), e.trim());
+            } else {
+                eprintln!("{} Zyte API error: {}", "✗".red().bold(), e);
+            }
+            1
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -1125,6 +1276,8 @@ fn main() {
             }
             Commands::DataDir => run_data_dir(),
             Commands::Validate { url } => run_validate(url).await,
+            Commands::DeepFetch { url, crawl_id } => run_deep_fetch(&cli, &url, crawl_id.as_deref()).await,
+            Commands::TestZyteApi { url } => run_test_zyte_api(&cli, &url).await,
         }
     });
 

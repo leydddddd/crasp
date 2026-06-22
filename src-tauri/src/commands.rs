@@ -43,6 +43,7 @@ pub struct SharedCrawlOutcomes {
     pub pages_skipped: std::sync::atomic::AtomicU64,
     pub used_mongo: std::sync::atomic::AtomicBool,
     pub local_file_path: parking_lot::Mutex<Option<String>>,
+    pub deep_fetched_count: std::sync::atomic::AtomicU64,
 }
 
 impl CrawlState {
@@ -77,6 +78,7 @@ impl SharedCrawlOutcomes {
         self.pages_skipped.store(0, std::sync::atomic::Ordering::SeqCst);
         self.used_mongo.store(false, std::sync::atomic::Ordering::SeqCst);
         *self.local_file_path.lock() = None;
+        self.deep_fetched_count.store(0, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn build_crawl_done_summary(&self, pages_archived: u64, cancelled: bool, crawl_id: &str) -> CrawlDoneSummary {
@@ -96,6 +98,7 @@ impl SharedCrawlOutcomes {
             cancelled,
             crawl_id: crawl_id.to_string(),
             storage_used,
+            deep_fetched_count: self.deep_fetched_count.load(std::sync::atomic::Ordering::SeqCst),
         }
     }
 }
@@ -285,6 +288,8 @@ pub async fn start_crawl(
 
     control.reset();
 
+    ctx.deep_fetch_queue.reset_counter();
+
     let _ = emit_log(&emitter, "info", "local", &format!("Crawl started: id={}, seed={}", crawl_id, config.seed_url));
 
     let shared = state.outcomes_arc();
@@ -293,11 +298,15 @@ pub async fn start_crawl(
         let crawler = Crawler::new();
         let result = crawler.run(config, emitter.clone(), &control, &crawl_id, &ctx_arc, &app_data_dir, Some(shared.clone())).await;
 
-        let (pages_archived, cancelled_flag) = match &result {
-            Ok(pages) => (pages.len() as u64, control.is_cancelled()),
-            Err(_) => (0, false),
+        let (pages_archived, cancelled_flag, deep_fetched) = match &result {
+            Ok(pages) => {
+                let df = pages.iter().filter(|p| p.deep_fetched == Some(true)).count() as u64;
+                (pages.len() as u64, control.is_cancelled(), df)
+            },
+            Err(_) => (0, false, 0),
         };
 
+        shared.deep_fetched_count.store(deep_fetched, std::sync::atomic::Ordering::SeqCst);
         let summary = shared.build_crawl_done_summary(pages_archived, cancelled_flag, &crawl_id);
 
         let _ = emitter.emit("crawl-done", &serde_json::to_value(&summary).unwrap_or_default()).await;
@@ -372,6 +381,8 @@ pub async fn start_cloud_crawl(
 
     let emitter = CraspEmitter::Tauri(TauriEmitter::new(app));
     let ctx_arc = ctx.inner().clone();
+
+    ctx.deep_fetch_queue.reset_counter();
 
     let _ = emit_log(&emitter, "info", "cloud", &format!("Cloud crawl started: id={}, seed={}", crawl_id, config.seed_url));
 
@@ -654,6 +665,8 @@ pub async fn local_scrapy_crawl(
     let control = new_control;
     let ctx_arc = ctx.inner().clone();
 
+    ctx.deep_fetch_queue.reset_counter();
+
     let app_data_dir = app
         .path()
         .app_data_dir()
@@ -836,6 +849,7 @@ pub struct PageSummary {
     pub extraction_method: Option<String>,
     pub extraction_confidence: Option<f32>,
     pub thin_content: Option<bool>,
+    pub deep_fetched: Option<bool>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -869,6 +883,7 @@ pub struct CrawlDoneSummary {
     pub cancelled: bool,
     pub crawl_id: String,
     pub storage_used: Option<StorageUsed>,
+    pub deep_fetched_count: u64,
 }
 
 pub fn parse_jl_pages(
@@ -999,6 +1014,9 @@ pub fn parse_jl_pages(
         let thin_content = item
             .get("thin_content")
             .and_then(|v| v.as_bool());
+        let deep_fetched = item
+            .get("deep_fetched")
+            .and_then(|v| v.as_bool());
 
         pages.push(PageSummary {
             url,
@@ -1027,6 +1045,7 @@ pub fn parse_jl_pages(
             extraction_method,
             extraction_confidence,
             thin_content,
+            deep_fetched,
         });
     }
 
@@ -1158,10 +1177,11 @@ pub async fn list_archived_pages(
                 body_text: doc.body_text.clone(),
                 body_html: doc.body_html.clone(),
                 assets: doc.assets.clone(),
-                extraction_method: doc.extraction_method.clone(),
-                extraction_confidence: doc.extraction_confidence,
-                thin_content: doc.thin_content,
-            });
+            extraction_method: doc.extraction_method.clone(),
+            extraction_confidence: doc.extraction_confidence,
+            thin_content: doc.thin_content,
+            deep_fetched: doc.deep_fetched,
+        });
         }
     }
 
@@ -1379,6 +1399,9 @@ async fn get_page_doc(
                             thin_content: item
                                 .get("thin_content")
                                 .and_then(|v| v.as_bool()),
+                            deep_fetched: item
+                                .get("deep_fetched")
+                                .and_then(|v| v.as_bool()),
                         };
                         return Ok(Some(page_doc));
                     }
@@ -1561,6 +1584,7 @@ pub async fn export_content(
                                 extraction_method: item.get("extraction_method").and_then(|v| v.as_str()).map(String::from),
                                 extraction_confidence: item.get("extraction_confidence").and_then(|v| v.as_f64()).map(|v| v as f32),
                                 thin_content: item.get("thin_content").and_then(|v| v.as_bool()),
+                                deep_fetched: item.get("deep_fetched").and_then(|v| v.as_bool()),
                             };
                             docs.push(pd);
                         }
@@ -1687,6 +1711,118 @@ pub async fn export_content(
             }
         }
     }
+}
+
+#[tauri::command]
+pub async fn deep_fetch_page(
+    url: String,
+    crawl_id: String,
+    ctx: tauri::State<'_, Arc<AppContext>>,
+    app: AppHandle,
+) -> Result<PageSummary, String> {
+    crate::ssrf::validate_seed_url(&url).await?;
+
+    let zyte = ctx
+        .zyte
+        .as_ref()
+        .ok_or("Zyte not configured — set ZYTE_API_KEY to enable deep fetch")?;
+
+    let _permit = ctx.deep_fetch_queue.acquire().await?;
+
+    let result = zyte.deep_fetch(&url, &ctx.http).await?;
+
+    let extraction = if let Some(ref article) = result.article {
+        crate::zyte::zyte_article_to_extraction(article, &result.browser_html, &url)
+    } else {
+        tokio::task::spawn_blocking({
+            let html = result.browser_html.clone();
+            let url = url.clone();
+            move || {
+                let er = crate::extraction::extract_main_content(&html, &url);
+                crate::extraction::ZyteExtractionResult {
+                    title: er.title,
+                    author: er.author,
+                    published_date: er.published_date,
+                    excerpt: er.excerpt,
+                    body_html: er.body_html,
+                    body_text: er.body_text,
+                    reading_time_minutes: er.reading_time_minutes,
+                    confidence: er.confidence,
+                    method: er.method.clone(),
+                    thin_content: er.thin_content,
+                }
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    };
+
+    if let Some(store) = &ctx.store {
+        let filter = mongodb::bson::doc! {
+            "url": &url,
+            "crawl_id": &crawl_id,
+        };
+        let update = mongodb::bson::doc! {
+            "$set": {
+                "body_html": &extraction.body_html,
+                "body_text": &extraction.body_text,
+                "extraction_method": &extraction.method,
+                "extraction_confidence": extraction.confidence,
+                "thin_content": extraction.thin_content,
+                "deep_fetched": true,
+            }
+        };
+        let options = mongodb::options::UpdateOptions::builder().build();
+        let _ = store
+            .pages_col()
+            .update_one(filter, update)
+            .with_options(options)
+            .await;
+    }
+
+    let emitter = CraspEmitter::Tauri(TauriEmitter::new(app));
+    let _ = emit_log(
+        &emitter,
+        "info",
+        "local",
+        &format!(
+            "Manual deep fetch complete for {} — method={}, confidence={:.2}, thin={}",
+            url, extraction.method, extraction.confidence, extraction.thin_content
+        ),
+    )
+    .await;
+
+    Ok(PageSummary {
+        url: url.clone(),
+        title: String::new(),
+        depth: 0,
+        stage: "Completed".to_string(),
+        status_reason: None,
+        content_size: 0,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        source: StorageSource::Mongo,
+        content_preview: None,
+        extracted_title: extraction.title,
+        author: extraction.author,
+        published_date: extraction.published_date,
+        excerpt: extraction.excerpt,
+        reading_time_minutes: Some(extraction.reading_time_minutes),
+        body_text: if !extraction.body_text.is_empty() {
+            Some(extraction.body_text)
+        } else {
+            None
+        },
+        body_html: if !extraction.body_html.is_empty() {
+            Some(extraction.body_html)
+        } else {
+            None
+        },
+        assets: None,
+        extraction_method: Some(extraction.method),
+        extraction_confidence: Some(extraction.confidence),
+        thin_content: Some(extraction.thin_content),
+        deep_fetched: Some(true),
+    })
 }
 
 #[tauri::command]

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::store::ArchiveStore;
-use crate::zyte::ZyteClient;
+use crate::zyte::{ZyteClient, DeepFetchConfig, DeepFetchQueue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -21,6 +21,8 @@ pub struct AppStatus {
     pub zyte_state: ServiceState,
     pub zyte_detail: Option<String>,
     pub zyte_project: Option<String>,
+    pub zyte_available: bool,
+    pub deep_fetch_enabled: bool,
 }
 
 pub struct AppContext {
@@ -29,6 +31,8 @@ pub struct AppContext {
     pub zyte_project: Option<String>,
     #[allow(dead_code)]
     pub http: Arc<reqwest::Client>,
+    pub deep_fetch_config: DeepFetchConfig,
+    pub deep_fetch_queue: DeepFetchQueue,
     mongo_state: AtomicU8,
     mongo_detail: parking_lot::Mutex<Option<String>>,
     zyte_state: AtomicU8,
@@ -99,11 +103,19 @@ impl AppContext {
                 .expect("failed to build shared HTTP client"),
         );
 
+        let deep_fetch_config = DeepFetchConfig::from_env();
+        let deep_fetch_queue = DeepFetchQueue::new(
+            deep_fetch_config.request_delay_ms,
+            deep_fetch_config.max_per_crawl,
+        );
+
         Ok(Self {
             store,
             zyte,
             zyte_project,
             http,
+            deep_fetch_config,
+            deep_fetch_queue,
             mongo_state: AtomicU8::new(mongo_initial.to_u8()),
             mongo_detail: parking_lot::Mutex::new(None),
             zyte_state: AtomicU8::new(zyte_initial.to_u8()),
@@ -120,11 +132,19 @@ impl AppContext {
                 .expect("failed to build shared HTTP client"),
         );
 
+        let deep_fetch_config = DeepFetchConfig::default();
+        let deep_fetch_queue = DeepFetchQueue::new(
+            deep_fetch_config.request_delay_ms,
+            deep_fetch_config.max_per_crawl,
+        );
+
         Self {
             store: None,
             zyte: None,
             zyte_project: None,
             http,
+            deep_fetch_config,
+            deep_fetch_queue,
             mongo_state: AtomicU8::new(ServiceState::NotConfigured.to_u8()),
             mongo_detail: parking_lot::Mutex::new(None),
             zyte_state: AtomicU8::new(ServiceState::NotConfigured.to_u8()),
@@ -165,6 +185,8 @@ impl AppContext {
             zyte_state: self.get_zyte_state(),
             zyte_detail: self.get_zyte_detail(),
             zyte_project: self.zyte_project.clone(),
+            zyte_available: self.zyte.is_some(),
+            deep_fetch_enabled: self.deep_fetch_config.enabled,
         }
     }
 }

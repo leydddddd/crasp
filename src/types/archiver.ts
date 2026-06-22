@@ -104,6 +104,7 @@ export interface ArchivedPage {
   extraction_method: string | null;
   extraction_confidence: number | null;
   thin_content: boolean | null;
+  deep_fetched: boolean | null;
 }
 
 export interface CrawlDiscoverPayload {
@@ -144,6 +145,7 @@ export interface CrawlDonePayload {
   cancelled: boolean;
   crawl_id: string;
   storage_used: StorageUsed | null;
+  deep_fetched_count: number;
 }
 
 export interface AppStatus {
@@ -152,6 +154,8 @@ export interface AppStatus {
   zyte_state: ServiceState;
   zyte_detail: string | null;
   zyte_project: string | null;
+  zyte_available: boolean;
+  deep_fetch_enabled: boolean;
 }
 
 export interface CloudProgressPayload {
@@ -188,6 +192,7 @@ export interface PageSummary {
   extraction_method: string | null;
   extraction_confidence: number | null;
   thin_content: boolean | null;
+  deep_fetched: boolean | null;
 }
 
 export interface MongoConnectionStatus {

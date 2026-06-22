@@ -39,6 +39,7 @@ pub fn run() {
             commands::list_local_crawls,
             commands::get_page_content,
             commands::export_content,
+            commands::deep_fetch_page,
             commands::reveal_in_explorer,
             commands::open_data_folder,
             commands::get_last_crawl_summary,
