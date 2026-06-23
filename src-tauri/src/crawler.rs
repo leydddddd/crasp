@@ -105,6 +105,7 @@ pub struct ArchivedPage {
     pub extraction_method: Option<String>,
     pub extraction_confidence: Option<f32>,
     pub thin_content: Option<bool>,
+    pub page_type: Option<String>,
     pub deep_fetched: Option<bool>,
     pub deep_fetch_duration_ms: Option<u64>,
 }
@@ -583,6 +584,7 @@ async fn process_page(
         extraction_method: None,
         extraction_confidence: None,
         thin_content: None,
+        page_type: None,
         deep_fetched: None,
         deep_fetch_duration_ms: None,
     };
@@ -756,6 +758,7 @@ async fn process_page(
     page.assets = Some(assets);
     page.extraction_method = Some(extraction.extraction_method().to_string());
     page.extraction_confidence = Some(extraction.confidence);
+    page.page_type = extraction.page_type.take();
     let extraction_method_str = extraction.extraction_method().to_string();
     let extraction_confidence_val = extraction.confidence;
     let extraction_failed_flag = extraction.extraction_failed;
@@ -877,6 +880,7 @@ async fn run_deep_fetch_if_available(
                                 };
                                 page.extraction_confidence = Some(extraction.confidence);
                                 page.thin_content = Some(extraction.thin_content);
+                                page.page_type = extraction.page_type.or(page.page_type);
                                 page.author = page.author.or(extraction.author);
                                 page.published_date = page.published_date.or(extraction.published_date);
                                 page.deep_fetched = Some(true);
@@ -959,6 +963,7 @@ async fn run_deep_fetch_if_available(
                                             confidence: er.confidence,
                                             method: er.method.clone(),
                                             thin_content: er.thin_content,
+                                            page_type: er.page_type,
                                         }
                                     }
                                 })
@@ -974,6 +979,7 @@ async fn run_deep_fetch_if_available(
                                     confidence: 0.0,
                                     method: "failed".to_string(),
                                     thin_content: true,
+                                    page_type: None,
                                 })
                             };
 
@@ -990,6 +996,7 @@ async fn run_deep_fetch_if_available(
                         page.extraction_method = Some(extraction.method);
                         page.extraction_confidence = Some(extraction.confidence);
                         page.thin_content = Some(extraction.thin_content);
+                        page.page_type = extraction.page_type.or(page.page_type);
                         page.author = page.author.or(extraction.author);
                         page.published_date = page.published_date.or(extraction.published_date);
                         page.deep_fetched = Some(true);

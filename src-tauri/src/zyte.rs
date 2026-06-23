@@ -237,6 +237,7 @@ pub fn zyte_article_to_extraction(
         confidence: 0.95,
         method: "zyte_autoextract".to_string(),
         thin_content: is_thin,
+        page_type: Some("article".to_string()),
     }
 }
 

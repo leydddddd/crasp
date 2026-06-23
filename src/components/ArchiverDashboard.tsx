@@ -62,7 +62,7 @@ function serviceStateLabel(state: ServiceState | undefined, name: string, detail
   switch (state) {
     case "connected": return `${name}: Connected${detail ? ` (${detail})` : ""}`;
     case "configured_unverified": return `${name}: Unverified`;
-    case "unreachable": return `${name}: Unreachable${detail ? ` — ${detail}` : ""}`;
+    case "unreachable": return `${name}: Unreachable${detail ? ` ï¿½ ${detail}` : ""}`;
     case "not_configured": default: return `${name}: Not configured`;
   }
 }
@@ -104,6 +104,26 @@ function extractionMethodBadge(method: string | null): React.ReactNode {
       return <span className="rounded px-1 py-0.5 text-[9px] bg-amber-900/30 text-amber-400 font-medium">{method}</span>;
     default:
       return <span className="rounded px-1 py-0.5 text-[9px] bg-gray-700/50 text-gray-400 font-medium">{method}</span>;
+  }
+}
+
+function pageTypeBadge(pageType: string | null): React.ReactNode {
+  if (!pageType) return null;
+  switch (pageType) {
+    case "article":
+      return <span className="rounded px-1 py-0.5 text-[9px] bg-blue-900/30 text-blue-400 font-medium">Article</span>;
+    case "spa_application":
+      return <span className="rounded px-1 py-0.5 text-[9px] bg-purple-900/30 text-purple-400 font-medium">SPA</span>;
+    case "ecommerce_product":
+      return <span className="rounded px-1 py-0.5 text-[9px] bg-emerald-900/30 text-emerald-400 font-medium">Product</span>;
+    case "navigation_index":
+      return <span className="rounded px-1 py-0.5 text-[9px] bg-gray-700/50 text-gray-300 font-medium">Index</span>;
+    case "media_gallery":
+      return <span className="rounded px-1 py-0.5 text-[9px] bg-orange-900/30 text-orange-400 font-medium">Gallery</span>;
+    case "unknown":
+      return <span className="rounded px-1 py-0.5 text-[9px] bg-gray-700/50 text-gray-400 font-medium">Unknown</span>;
+    default:
+      return <span className="rounded px-1 py-0.5 text-[9px] bg-gray-700/50 text-gray-400 font-medium">{pageType}</span>;
   }
 }
 
@@ -510,10 +530,10 @@ export function ArchiverDashboard() {
                 <div className="flex items-center gap-1.5 text-[11px]">
                   <span
                     className={`h-2 w-2 rounded-full ${archiver.appStatus?.chrome_available ? "bg-emerald-500" : "bg-gray-600"}`}
-                    title={archiver.appStatus?.chrome_available ? "Chrome ?" : "No Chrome — deep fetch unavailable"}
+                    title={archiver.appStatus?.chrome_available ? "Chrome ?" : "No Chrome ï¿½ deep fetch unavailable"}
                   />
                   <span className="text-gray-400">
-                    {archiver.appStatus?.chrome_available ? "Chrome ?" : "No Chrome — deep fetch unavailable"}
+                    {archiver.appStatus?.chrome_available ? "Chrome ?" : "No Chrome ï¿½ deep fetch unavailable"}
                   </span>
                 </div>
               </div>
@@ -762,7 +782,7 @@ export function ArchiverDashboard() {
             </button>
             <span className="text-[10px] text-gray-700">
               {archiver.stats.completed} archived
-              {archiver.stats.failed > 0 && ` · ${archiver.stats.failed} failed`}
+              {archiver.stats.failed > 0 && ` ï¿½ ${archiver.stats.failed} failed`}
             </span>
           </div>
         </main>
@@ -897,7 +917,7 @@ function DetailDrawer({
         <div className="mx-4 mb-3 flex items-center gap-2">
           <div className="flex items-center gap-1.5 rounded-md bg-amber-900/20 px-2.5 py-1.5 text-xs text-amber-400 border border-amber-800/40">
             <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-            <span>Thin content — JS rendering may be needed</span>
+            <span>Thin content ï¿½ JS rendering may be needed</span>
           </div>
           {page.deep_fetched && (
             <span className="inline-flex items-center gap-1 rounded-md bg-emerald-900/20 px-2.5 py-1.5 text-xs text-emerald-400 border border-emerald-800/40">
@@ -907,10 +927,11 @@ function DetailDrawer({
           )}
         </div>
       )}
-      {page.extraction_method && (
+      {(page.extraction_method || page.page_type) && (
         <div className="mx-4 mb-3 flex items-center gap-2 text-xs">
           <span className="text-gray-500">Extraction:</span>
-          {extractionMethodBadge(page.extraction_method)}
+          {page.page_type && pageTypeBadge(page.page_type)}
+          {page.extraction_method && extractionMethodBadge(page.extraction_method)}
           {page.extraction_confidence != null && (
             <span className="text-gray-600">confidence: {(page.extraction_confidence * 100).toFixed(0)}%</span>
           )}
@@ -1365,7 +1386,7 @@ function ArchiveViewer({
         <div className="border-t border-gray-800 bg-gray-900">
           <div className="flex items-center justify-between border-b border-gray-800/50 px-4 py-2">
             <h3 className="text-sm font-semibold text-gray-200 truncate flex-1 mr-4">
-              Content Preview — {previewPage.title || previewPage.url}
+              Content Preview ï¿½ {previewPage.title || previewPage.url}
             </h3>
             <div className="flex items-center gap-2">
               {sourceBadge(previewPage.source)}
@@ -1378,6 +1399,15 @@ function ArchiveViewer({
             </div>
           </div>
           <div className="p-4">
+            {(previewPage.page_type || previewPage.extraction_method) && (
+              <div className="mb-3 flex flex-wrap items-center gap-2 text-[11px]">
+                {pageTypeBadge(previewPage.page_type)}
+                {extractionMethodBadge(previewPage.extraction_method)}
+                {previewPage.extraction_confidence != null && (
+                  <span className="text-gray-600">confidence: {(previewPage.extraction_confidence * 100).toFixed(0)}%</span>
+                )}
+              </div>
+            )}
             {(previewPage.author || previewPage.published_date || (previewPage.reading_time_minutes != null && previewPage.reading_time_minutes > 0) || previewPage.thin_content) && (
               <div className="mb-3 flex flex-wrap items-center gap-3 text-[11px]">
                 {previewPage.author && (

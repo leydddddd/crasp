@@ -29,44 +29,40 @@ impl Default for HeadlessConfig {
 }
 
 pub fn find_chrome_binary() -> Option<PathBuf> {
-    if cfg!(target_os = "windows") {
-        let paths = [
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
-            r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
-            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        ];
-        for p in &paths {
-            let pb = PathBuf::from(p);
-            if pb.exists() {
-                return Some(pb);
-            }
-        }
-        None
-    } else if cfg!(target_os = "macos") {
-        let paths = [
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-        ];
-        for p in &paths {
-            let pb = PathBuf::from(p);
-            if pb.exists() {
-                return Some(pb);
-            }
-        }
-        None
-    } else {
-        let binaries = ["google-chrome", "google-chrome-stable", "chromium-browser", "chromium", "microsoft-edge"];
-        for bin_name in &binaries {
-            if let Ok(path) = which::which(bin_name) {
-                return Some(path);
-            }
-        }
-        None
+    let auto_found = chromiumoxide::detection::default_executable(
+        chromiumoxide::detection::DetectionOptions::default(),
+    ).ok();
+
+    let mut windows_paths: Vec<std::path::PathBuf> = vec![
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe".into(),
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe".into(),
+        r"C:\Program Files\Chromium\Application\chrome.exe".into(),
+        r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe".into(),
+        r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe".into(),
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe".into(),
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe".into(),
+    ];
+
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        let lad = std::path::PathBuf::from(&local_app_data);
+        windows_paths.push(lad.join("Google\\Chrome\\Application\\chrome.exe"));
+        windows_paths.push(lad.join("Microsoft\\Edge\\Application\\msedge.exe"));
     }
+
+    let candidate = auto_found.or_else(|| {
+        windows_paths.iter().find(|p| p.exists()).cloned()
+    });
+
+    candidate.and_then(|path| {
+        let metadata = std::fs::metadata(&path).ok()?;
+        if metadata.len() < 100_000 {
+            eprintln!(
+                "[headless] Warning: Chrome binary at {} is suspiciously small ({} bytes) — may be a launcher stub",
+                path.display(), metadata.len()
+            );
+        }
+        Some(path)
+    })
 }
 
 pub struct HeadlessBrowser {
@@ -78,40 +74,53 @@ pub struct HeadlessBrowser {
 impl HeadlessBrowser {
     pub async fn launch(config: HeadlessConfig) -> Result<Self, String> {
         let chrome_path = find_chrome_binary()
-            .ok_or("Chrome/Chromium binary not found. Install Chrome to enable deep fetch.")?;
+            .ok_or("Chrome/Chromium binary not found. Install Chrome to enable deep fetch.".to_string())?;
 
-        let mut builder = BrowserConfig::builder()
-            .chrome_executable(chrome_path)
-            .no_sandbox()
-            .disable_default_args();
-
-        if !config.load_images {
-            builder = builder.arg("--blink-settings=imagesEnabled=false");
+        eprintln!("[headless] Chrome binary: {}", chrome_path.display());
+        if let Ok(metadata) = std::fs::metadata(&chrome_path) {
+            eprintln!("[headless] Chrome binary size: {} bytes", metadata.len());
         }
 
-        builder = builder
-            .arg("--headless=new")
+        // Do NOT call disable_default_args() — chromiumoxide's DEFAULT_ARGS
+        // include --disable-dev-shm-usage, --disable-extensions, --no-first-run,
+        // and other flags needed for a stable headless session.
+        //
+        // chromiumoxide automatically:
+        //   - adds --remote-debugging-port=0  (port 0 = OS picks free port)
+        //   - adds --headless --hide-scrollbars --mute-audio  (since headless: true by default)
+        //   - adds --no-sandbox --disable-setuid-sandbox  (via no_sandbox())
+        //   - creates a temp --user-data-dir  (avoiding profile lock issues)
+        //
+        // We only add args NOT already present in DEFAULT_ARGS.
+
+        let builder = BrowserConfig::builder()
+            .no_sandbox()
+            .chrome_executable(&chrome_path)
             .arg("--disable-gpu")
-            .arg("--no-first-run")
-            .arg("--no-default-browser-check")
-            .arg("--disable-extensions")
-            .arg("--disable-background-networking")
-            .arg("--disable-sync")
-            .arg("--disable-translate");
+            .arg("--no-default-browser-check");
+
+        let builder = if !config.load_images {
+            builder.arg("--blink-settings=imagesEnabled=false")
+        } else {
+            builder
+        };
 
         let browser_config = builder
             .build()
             .map_err(|e| format!("Failed to configure Chromium: {}", e))?;
 
+        eprintln!("[headless] Launching Chrome...");
+
         let (browser, mut handler) = Browser::launch(browser_config)
             .await
             .map_err(|e| format!("Failed to launch Chromium: {}", e))?;
 
+        eprintln!("[headless] Chrome launched successfully");
+
         let handler_handle = tokio::spawn(async move {
             loop {
-                match StreamExt::next(&mut handler).await {
-                    Some(_) => {}
-                    None => break,
+                if handler.next().await.is_none() {
+                    break;
                 }
             }
         });
@@ -136,18 +145,30 @@ impl HeadlessBrowser {
                 .map_err(|e| format!("Failed to set user agent: {}", e))?;
         }
 
-        let _nav_result = tokio::time::timeout(
+        eprintln!("[headless] Navigating to {} (timeout: {}ms)...", url, self.config.timeout_ms);
+
+        let nav_result = tokio::time::timeout(
             std::time::Duration::from_millis(self.config.timeout_ms),
             page.goto(url),
         )
-        .await
-        .map_err(|_| {
-            format!(
-                "Navigation timeout after {}ms for {}",
-                self.config.timeout_ms, url
-            )
-        })?
-        .map_err(|e| format!("Navigation failed for {}: {}", url, e))?;
+        .await;
+
+        match &nav_result {
+            Ok(Ok(_)) => eprintln!("[headless] Navigation succeeded"),
+            Ok(Err(e)) => eprintln!("[headless] Navigation error: {}", e),
+            Err(_) => eprintln!("[headless] Navigation timed out after {}ms", self.config.timeout_ms),
+        }
+
+        let _nav_result = nav_result
+            .map_err(|_| {
+                format!(
+                    "Navigation timeout after {}ms for {}",
+                    self.config.timeout_ms, url
+                )
+            })?
+            .map_err(|e| format!("Navigation failed for {}: {}", url, e))?;
+
+        eprintln!("[headless] Waiting for idle ({}ms)...", self.config.wait_for_idle_ms);
 
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(self.config.wait_for_idle_ms),
@@ -160,14 +181,28 @@ impl HeadlessBrowser {
         ))
         .await;
 
+        eprintln!("[headless] Getting page content...");
+
         let html = page
             .content()
             .await
             .map_err(|e| format!("Failed to get page content for {}: {}", url, e))?;
 
+        eprintln!("[headless] Page content retrieved: {} chars", html.len());
+
         let final_url = match page.url().await {
-            Ok(Some(u)) => u,
-            _ => url.to_string(),
+            Ok(Some(u)) => {
+                eprintln!("[headless] Final URL: {}", u);
+                u
+            }
+            Ok(None) => {
+                eprintln!("[headless] No final URL returned");
+                url.to_string()
+            }
+            Err(e) => {
+                eprintln!("[headless] URL retrieval error: {}", e);
+                url.to_string()
+            }
         };
 
         page.close().await.ok();

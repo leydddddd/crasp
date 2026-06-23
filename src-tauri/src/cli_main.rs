@@ -358,6 +358,7 @@ async fn run_crawl(
                 extraction_method: None,
                 extraction_confidence: None,
                 thin_content: None,
+                page_type: None,
                 deep_fetched: None,
                 deep_fetch_duration_ms: None,
             }).collect::<Vec<_>>()
@@ -464,6 +465,7 @@ async fn run_list(
                     extraction_method: doc.extraction_method.clone(),
                     extraction_confidence: doc.extraction_confidence,
                     thin_content: doc.thin_content,
+                    page_type: doc.page_type.clone(),
                     deep_fetched: doc.deep_fetched,
                     deep_fetch_duration_ms: doc.deep_fetch_duration_ms,
                 });
@@ -926,6 +928,7 @@ async fn load_page_docs_for_export(ctx: &Arc<crasp_lib::runtime::AppContext>, cr
                         extraction_method: item.get("extraction_method").and_then(|v| v.as_str()).map(String::from),
                         extraction_confidence: item.get("extraction_confidence").and_then(|v| v.as_f64()).map(|v| v as f32),
                         thin_content: item.get("thin_content").and_then(|v| v.as_bool()),
+                        page_type: item.get("page_type").and_then(|v| v.as_str()).map(String::from),
                         deep_fetched: item.get("deep_fetched").and_then(|v| v.as_bool()),
                         deep_fetch_duration_ms: item.get("deep_fetch_duration_ms").and_then(|v| v.as_u64()),
                     });
@@ -1183,6 +1186,7 @@ async fn run_deep_fetch(cli: &Cli, url: &str, crawl_id: Option<&str>, wait_ms: u
                         "extraction_method": &method_label,
                         "extraction_confidence": extraction.confidence,
                         "thin_content": extraction.thin_content,
+                        "page_type": extraction.page_type.clone(),
                         "deep_fetched": true,
                         "deep_fetch_duration_ms": duration_ms as i64,
                     }
@@ -1225,6 +1229,7 @@ async fn run_deep_fetch(cli: &Cli, url: &str, crawl_id: Option<&str>, wait_ms: u
                         confidence: er.confidence,
                         method: er.method.clone(),
                         thin_content: er.thin_content,
+                        page_type: er.page_type,
                     }
                 };
 
@@ -1238,6 +1243,7 @@ async fn run_deep_fetch(cli: &Cli, url: &str, crawl_id: Option<&str>, wait_ms: u
                                 "extraction_method": &extraction.method,
                                 "extraction_confidence": extraction.confidence,
                                 "thin_content": extraction.thin_content,
+                                "page_type": extraction.page_type.clone(),
                                 "deep_fetched": true,
                             }
                         };

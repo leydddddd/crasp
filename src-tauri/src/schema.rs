@@ -59,6 +59,7 @@ pub struct PageDoc {
     pub extraction_method: Option<String>,
     pub extraction_confidence: Option<f32>,
     pub thin_content: Option<bool>,
+    pub page_type: Option<String>,
     pub deep_fetched: Option<bool>,
     pub deep_fetch_duration_ms: Option<u64>,
 }

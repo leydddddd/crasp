@@ -104,6 +104,7 @@ export interface ArchivedPage {
   extraction_method: string | null;
   extraction_confidence: number | null;
   thin_content: boolean | null;
+  page_type: string | null;
   deep_fetched: boolean | null;
   deep_fetch_duration_ms: number | null;
 }
@@ -194,6 +195,7 @@ export interface PageSummary {
   extraction_method: string | null;
   extraction_confidence: number | null;
   thin_content: boolean | null;
+  page_type: string | null;
   deep_fetched: boolean | null;
   deep_fetch_duration_ms: number | null;
 }

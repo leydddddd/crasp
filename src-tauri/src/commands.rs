@@ -849,6 +849,7 @@ pub struct PageSummary {
     pub extraction_method: Option<String>,
     pub extraction_confidence: Option<f32>,
     pub thin_content: Option<bool>,
+    pub page_type: Option<String>,
     pub deep_fetched: Option<bool>,
     pub deep_fetch_duration_ms: Option<u64>,
 }
@@ -1015,6 +1016,10 @@ pub fn parse_jl_pages(
         let thin_content = item
             .get("thin_content")
             .and_then(|v| v.as_bool());
+        let page_type = item
+            .get("page_type")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let deep_fetched = item
             .get("deep_fetched")
             .and_then(|v| v.as_bool());
@@ -1049,6 +1054,7 @@ pub fn parse_jl_pages(
             extraction_method,
             extraction_confidence,
             thin_content,
+            page_type,
             deep_fetched,
             deep_fetch_duration_ms,
         });
@@ -1182,11 +1188,12 @@ pub async fn list_archived_pages(
                 body_text: doc.body_text.clone(),
                 body_html: doc.body_html.clone(),
                 assets: doc.assets.clone(),
-            extraction_method: doc.extraction_method.clone(),
-            extraction_confidence: doc.extraction_confidence,
-            thin_content: doc.thin_content,
-            deep_fetched: doc.deep_fetched,
-            deep_fetch_duration_ms: doc.deep_fetch_duration_ms,
+                extraction_method: doc.extraction_method.clone(),
+                extraction_confidence: doc.extraction_confidence,
+                thin_content: doc.thin_content,
+                page_type: doc.page_type.clone(),
+                deep_fetched: doc.deep_fetched,
+                deep_fetch_duration_ms: doc.deep_fetch_duration_ms,
         });
         }
     }
@@ -1405,6 +1412,10 @@ async fn get_page_doc(
                             thin_content: item
                                 .get("thin_content")
                                 .and_then(|v| v.as_bool()),
+                            page_type: item
+                                .get("page_type")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
                             deep_fetched: item
                                 .get("deep_fetched")
                                 .and_then(|v| v.as_bool()),
@@ -1593,6 +1604,7 @@ pub async fn export_content(
                                 extraction_method: item.get("extraction_method").and_then(|v| v.as_str()).map(String::from),
                                 extraction_confidence: item.get("extraction_confidence").and_then(|v| v.as_f64()).map(|v| v as f32),
                                 thin_content: item.get("thin_content").and_then(|v| v.as_bool()),
+                                page_type: item.get("page_type").and_then(|v| v.as_str()).map(String::from),
                                 deep_fetched: item.get("deep_fetched").and_then(|v| v.as_bool()),
                                 deep_fetch_duration_ms: item.get("deep_fetch_duration_ms").and_then(|v| v.as_u64()),
                             };
@@ -1775,6 +1787,7 @@ pub async fn deep_fetch_page(
                         "extraction_method": &method_label,
                         "extraction_confidence": extraction.confidence,
                         "thin_content": extraction.thin_content,
+                        "page_type": extraction.page_type.clone(),
                         "deep_fetched": true,
                         "deep_fetch_duration_ms": duration_ms as i64,
                     }
@@ -1835,6 +1848,7 @@ pub async fn deep_fetch_page(
             extraction_method: Some(method_label),
             extraction_confidence: Some(extraction.confidence),
             thin_content: Some(extraction.thin_content),
+            page_type: extraction.page_type.clone(),
             deep_fetched: Some(true),
             deep_fetch_duration_ms: Some(duration_ms),
         })
@@ -1862,6 +1876,7 @@ pub async fn deep_fetch_page(
                         confidence: er.confidence,
                         method: er.method.clone(),
                         thin_content: er.thin_content,
+                        page_type: er.page_type,
                     }
                 }
             })
@@ -1882,6 +1897,7 @@ pub async fn deep_fetch_page(
                         "extraction_method": &extraction.method,
                         "extraction_confidence": extraction.confidence,
                         "thin_content": extraction.thin_content,
+                        "page_type": extraction.page_type.clone(),
                         "deep_fetched": true,
                     }
                 };
@@ -1935,6 +1951,7 @@ pub async fn deep_fetch_page(
             extraction_method: Some(extraction.method),
             extraction_confidence: Some(extraction.confidence),
             thin_content: Some(extraction.thin_content),
+            page_type: extraction.page_type.clone(),
             deep_fetched: Some(true),
             deep_fetch_duration_ms: None,
         })

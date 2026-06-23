@@ -5,6 +5,29 @@ use url::Url;
 
 use crate::schema::{AssetDocument, AssetImage, AssetVideo, PageAssets};
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum PageType {
+    Article,
+    SpaApplication,
+    EcommerceProduct,
+    NavigationIndex,
+    MediaGallery,
+    Unknown,
+}
+
+impl PageType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PageType::Article => "article",
+            PageType::SpaApplication => "spa_application",
+            PageType::EcommerceProduct => "ecommerce_product",
+            PageType::NavigationIndex => "navigation_index",
+            PageType::MediaGallery => "media_gallery",
+            PageType::Unknown => "unknown",
+        }
+    }
+}
+
 pub struct ExtractionResult {
     pub title: Option<String>,
     pub author: Option<String>,
@@ -17,6 +40,7 @@ pub struct ExtractionResult {
     pub thin_content: bool,
     pub extraction_failed: bool,
     pub method: String,
+    pub page_type: Option<String>,
 }
 
 pub struct ZyteExtractionResult {
@@ -30,6 +54,476 @@ pub struct ZyteExtractionResult {
     pub confidence: f32,
     pub method: String,
     pub thin_content: bool,
+    pub page_type: Option<String>,
+}
+
+pub struct StructuredData {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub author: Option<String>,
+    pub date_published: Option<String>,
+    pub body_text: Option<String>,
+    pub image_url: Option<String>,
+    pub page_type: Option<String>,
+}
+
+impl StructuredData {
+    fn empty() -> Self {
+        Self {
+            title: None,
+            description: None,
+            author: None,
+            date_published: None,
+            body_text: None,
+            image_url: None,
+            page_type: None,
+        }
+    }
+}
+
+struct PageSignals {
+    og_type: Option<String>,
+    jsonld_types: Vec<String>,
+    has_article_tag: bool,
+    has_main_tag: bool,
+    p_count: usize,
+    p_to_div_ratio: f32,
+    text_ratio: f32,
+    svg_ratio: f32,
+    interactive_density: f32,
+    img_to_p_ratio: f32,
+    link_density: f32,
+}
+
+fn compute_signals(html: &str) -> PageSignals {
+    let og_type = extract_meta_property(html, "og:type");
+    let jsonld_types = extract_jsonld_types(html);
+    let p_count = html.matches("<p").count();
+    let div_count = html.matches("<div").count();
+    let p_to_div_ratio = p_count as f32 / (div_count + 1) as f32;
+    let has_article_tag = html.contains("<article");
+    let has_main_tag = html.contains("<main")
+        || html.contains("role=\"main\"")
+        || html.contains("role='main'");
+
+    let total_html_chars = html.len();
+    let text_ratio = if total_html_chars == 0 {
+        0.0
+    } else {
+        count_text_chars(html) as f32 / total_html_chars as f32
+    };
+
+    let svg_ratio = if total_html_chars == 0 {
+        0.0
+    } else {
+        count_svg_chars(html) as f32 / total_html_chars as f32
+    };
+
+    let interactive_density =
+        (html.matches("<button").count() + html.matches("<input").count()) as f32
+            / (p_count + 1) as f32;
+
+    let img_to_p_ratio = html.matches("<img").count() as f32 / (p_count + 1) as f32;
+
+    let href_count = html.matches("href=").count();
+    let link_density = href_count as f32 / (href_count + p_count + 1) as f32;
+
+    PageSignals {
+        og_type,
+        jsonld_types,
+        has_article_tag,
+        has_main_tag,
+        p_count,
+        p_to_div_ratio,
+        text_ratio,
+        svg_ratio,
+        interactive_density,
+        img_to_p_ratio,
+        link_density,
+    }
+}
+
+fn extract_meta_property(html: &str, property: &str) -> Option<String> {
+    let patterns = [
+        format!("property=\"{}\"", property),
+        format!("property='{}'", property),
+    ];
+
+    for pat in &patterns {
+        if let Some(idx) = html.find(pat) {
+            let slice = &html[idx..];
+            if let Some(content_idx) = slice.find("content=") {
+                let content_slice = &slice[content_idx + "content=".len()..];
+                if let Some(value) = extract_quoted_value(content_slice) {
+                    let trimmed = value.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_jsonld_types(html: &str) -> Vec<String> {
+    let mut types = Vec::new();
+    for block in extract_jsonld_blocks(html) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&block) {
+            collect_jsonld_types(&val, &mut types);
+        }
+    }
+    types
+}
+
+fn collect_jsonld_types(val: &serde_json::Value, types: &mut Vec<String>) {
+    match val {
+        serde_json::Value::Object(map) => {
+            if let Some(t) = map.get("@type") {
+                match t {
+                    serde_json::Value::String(s) => types.push(s.to_string()),
+                    serde_json::Value::Array(arr) => {
+                        for entry in arr {
+                            if let Some(s) = entry.as_str() {
+                                types.push(s.to_string());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for (_key, value) in map {
+                collect_jsonld_types(value, types);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for entry in arr {
+                collect_jsonld_types(entry, types);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_quoted_value(input: &str) -> Option<String> {
+    let mut chars = input.chars();
+    let quote = match chars.next() {
+        Some('"') => '"',
+        Some('\'') => '\'',
+        _ => return None,
+    };
+    let mut value = String::new();
+    for c in chars {
+        if c == quote {
+            break;
+        }
+        value.push(c);
+    }
+    Some(value)
+}
+
+fn count_text_chars(html: &str) -> usize {
+    let mut in_tag = false;
+    let mut count = 0usize;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ => if !in_tag { count += 1; },
+        }
+    }
+    count
+}
+
+fn count_svg_chars(html: &str) -> usize {
+    let mut total = 0usize;
+    let mut start_idx = 0usize;
+
+    while let Some(open_idx) = html[start_idx..].find("<svg") {
+        let abs_open = start_idx + open_idx;
+        if let Some(tag_end_idx) = html[abs_open..].find('>') {
+            let content_start = abs_open + tag_end_idx + 1;
+            if let Some(close_idx) = html[content_start..].find("</svg>") {
+                let content_end = content_start + close_idx;
+                total += html[content_start..content_end].len();
+                start_idx = content_end + "</svg>".len();
+                continue;
+            }
+        }
+        break;
+    }
+
+    total
+}
+
+fn classify_page(html: &str) -> PageType {
+    let signals = compute_signals(html);
+
+    const LINK_DENSITY_NAV_MIN: f32 = 0.97;
+    const P_COUNT_NAV_MAX: usize = 12;
+    let is_strong_nav = signals.link_density >= LINK_DENSITY_NAV_MIN
+        && signals.p_count < P_COUNT_NAV_MAX
+        && !signals.has_article_tag;
+
+    for jsonld_type in &signals.jsonld_types {
+        match jsonld_type.to_lowercase().as_str() {
+            "article" | "newsarticle" | "blogposting" | "technicalarticle" => {
+                if is_strong_nav {
+                    return PageType::NavigationIndex;
+                }
+                return PageType::Article;
+            }
+            "product" => return PageType::EcommerceProduct,
+            "website" | "webpage" => {}
+            _ => {}
+        }
+    }
+
+    if let Some(ref og) = signals.og_type {
+        match og.as_str() {
+            "article" => {
+                if is_strong_nav {
+                    return PageType::NavigationIndex;
+                }
+                return PageType::Article;
+            }
+            "product" => return PageType::EcommerceProduct,
+            _ => {}
+        }
+    }
+
+    const P_COUNT_ARTICLE_MIN: usize = 24;
+    const P_TO_DIV_ARTICLE_MIN: f32 = 0.08;
+    const INTERACTIVE_DENSITY_MAX: f32 = 1.0;
+    const LINK_DENSITY_MAX: f32 = 0.95;
+    const TEXT_RATIO_ARTICLE_MAX: f32 = 0.60;
+
+    if signals.p_count >= P_COUNT_ARTICLE_MIN
+        && signals.p_to_div_ratio >= P_TO_DIV_ARTICLE_MIN
+        && signals.interactive_density < INTERACTIVE_DENSITY_MAX
+        && signals.link_density < LINK_DENSITY_MAX
+        && signals.text_ratio <= TEXT_RATIO_ARTICLE_MAX
+        && (signals.has_article_tag || signals.has_main_tag)
+    {
+        return PageType::Article;
+    }
+
+    if signals.link_density >= LINK_DENSITY_NAV_MIN
+        && signals.p_count < P_COUNT_NAV_MAX
+        && !signals.has_article_tag
+    {
+        return PageType::NavigationIndex;
+    }
+
+    const TEXT_RATIO_SPA_MAX: f32 = 0.20;
+    const INTERACTIVE_DENSITY_SPA_MIN: f32 = 0.20;
+    const SVG_RATIO_SPA_MIN: f32 = 0.007;
+
+    if signals.text_ratio < TEXT_RATIO_SPA_MAX
+        || signals.interactive_density >= INTERACTIVE_DENSITY_SPA_MIN
+        || signals.svg_ratio >= SVG_RATIO_SPA_MIN
+    {
+        return PageType::SpaApplication;
+    }
+
+    const IMG_TO_P_GALLERY_MIN: f32 = 2.5;
+    const P_COUNT_GALLERY_MAX: usize = 12;
+
+    if signals.img_to_p_ratio >= IMG_TO_P_GALLERY_MIN
+        && signals.p_count < P_COUNT_GALLERY_MAX
+    {
+        return PageType::MediaGallery;
+    }
+
+    let has_price_pattern = html.contains("itemprop=\"price\"")
+        || html.contains("class=\"price\"")
+        || html.contains("data-price=");
+    if has_price_pattern {
+        return PageType::EcommerceProduct;
+    }
+
+    PageType::Unknown
+}
+
+fn extract_structured_data(html: &str) -> StructuredData {
+    let mut data = StructuredData::empty();
+
+    for block in extract_jsonld_blocks(html) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&block) {
+            merge_structured_data_from_jsonld(&val, &mut data);
+        }
+    }
+
+    let og_title = extract_meta_property(html, "og:title");
+    let og_description = extract_meta_property(html, "og:description");
+    let og_image = extract_meta_property(html, "og:image");
+    let og_type = extract_meta_property(html, "og:type");
+    let og_author = extract_meta_property(html, "article:author");
+    let og_published = extract_meta_property(html, "article:published_time");
+
+    let meta_description = extract_meta_name(html, "description");
+    let meta_author = extract_meta_name(html, "author");
+
+    if data.title.is_none() {
+        data.title = og_title;
+    }
+    if data.description.is_none() {
+        data.description = og_description.or(meta_description);
+    }
+    if data.author.is_none() {
+        data.author = og_author.or(meta_author);
+    }
+    if data.date_published.is_none() {
+        data.date_published = og_published;
+    }
+    if data.image_url.is_none() {
+        data.image_url = og_image;
+    }
+    if data.page_type.is_none() {
+        data.page_type = og_type;
+    }
+
+    data
+}
+
+fn extract_jsonld_blocks(html: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut start_idx = 0usize;
+
+    while let Some(script_idx) = html[start_idx..].find("<script") {
+        let abs_script = start_idx + script_idx;
+        let Some(tag_end_idx) = html[abs_script..].find('>') else {
+            break;
+        };
+        let tag_end = abs_script + tag_end_idx + 1;
+        let tag_head = &html[abs_script..tag_end];
+        if tag_head.contains("application/ld+json") {
+            if let Some(close_idx) = html[tag_end..].find("</script>") {
+                let content_end = tag_end + close_idx;
+                let content = html[tag_end..content_end].trim();
+                if !content.is_empty() {
+                    blocks.push(content.to_string());
+                }
+                start_idx = content_end + "</script>".len();
+                continue;
+            }
+        }
+        start_idx = tag_end;
+    }
+
+    blocks
+}
+
+fn merge_structured_data_from_jsonld(
+    val: &serde_json::Value,
+    data: &mut StructuredData,
+) {
+    match val {
+        serde_json::Value::Object(map) => {
+            if data.title.is_none() {
+                if let Some(v) = map.get("headline").or_else(|| map.get("name")) {
+                    data.title = extract_string_value(v, &["name"]);
+                }
+            }
+            if data.description.is_none() {
+                if let Some(v) = map.get("description") {
+                    data.description = extract_string_value(v, &[]);
+                }
+            }
+            if data.author.is_none() {
+                if let Some(v) = map.get("author") {
+                    data.author = extract_string_value(v, &["name"]);
+                }
+            }
+            if data.date_published.is_none() {
+                if let Some(v) = map.get("datePublished") {
+                    data.date_published = extract_string_value(v, &[]);
+                }
+            }
+            if data.body_text.is_none() {
+                if let Some(v) = map.get("articleBody") {
+                    data.body_text = extract_string_value(v, &[]);
+                }
+            }
+            if data.image_url.is_none() {
+                if let Some(v) = map.get("image") {
+                    data.image_url = extract_string_value(v, &["url", "contentUrl"]);
+                }
+            }
+            if data.page_type.is_none() {
+                if let Some(v) = map.get("@type") {
+                    data.page_type = extract_string_value(v, &[]);
+                }
+            }
+
+            for (_key, value) in map {
+                merge_structured_data_from_jsonld(value, data);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for entry in arr {
+                merge_structured_data_from_jsonld(entry, data);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_string_value(
+    val: &serde_json::Value,
+    preferred_keys: &[&str],
+) -> Option<String> {
+    match val {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+        }
+        serde_json::Value::Array(arr) => {
+            for entry in arr {
+                if let Some(found) = extract_string_value(entry, preferred_keys) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        serde_json::Value::Object(map) => {
+            for key in preferred_keys {
+                if let Some(v) = map.get(*key) {
+                    if let Some(found) = extract_string_value(v, preferred_keys) {
+                        return Some(found);
+                    }
+                }
+            }
+            if let Some(v) = map.get("@value") {
+                return extract_string_value(v, preferred_keys);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn extract_meta_name(html: &str, name: &str) -> Option<String> {
+    let patterns = [
+        format!("name=\"{}\"", name),
+        format!("name='{}'", name),
+    ];
+
+    for pat in &patterns {
+        if let Some(idx) = html.find(pat) {
+            let slice = &html[idx..];
+            if let Some(content_idx) = slice.find("content=") {
+                let content_slice = &slice[content_idx + "content=".len()..];
+                if let Some(value) = extract_quoted_value(content_slice) {
+                    let trimmed = value.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 impl ExtractionResult {
@@ -50,34 +544,56 @@ impl ExtractionResult {
             thin_content: true,
             extraction_failed: true,
             method: "raw".to_string(),
+            page_type: None,
         }
     }
 }
 
 pub fn extract_main_content(html: &str, base_url: &str) -> ExtractionResult {
+    let page_type = classify_page(html);
+    let structured = extract_structured_data(html);
+
+    let mut result = match page_type {
+        PageType::Article => extract_article(html, base_url, &structured),
+        PageType::SpaApplication => extract_spa(html, base_url, &structured),
+        PageType::EcommerceProduct => extract_product(html, base_url, &structured),
+        PageType::NavigationIndex => extract_navigation(html, base_url, &structured),
+        PageType::MediaGallery => extract_gallery(html, base_url, &structured),
+        PageType::Unknown => extract_unknown(html, base_url, &structured),
+    };
+
+    if result.title.is_none() {
+        result.title = structured.title.clone();
+    }
+    if result.author.is_none() {
+        result.author = structured.author.clone();
+    }
+    if result.published_date.is_none() {
+        result.published_date = structured.date_published.clone();
+    }
+    if result.excerpt.is_none() {
+        result.excerpt = structured.description.clone();
+    }
+
+    result.page_type = Some(page_type.as_str().to_string());
+    result
+}
+
+fn extract_article(html: &str, base_url: &str, _structured: &StructuredData) -> ExtractionResult {
     let full_text = extract_all_text(html);
 
     if let Some(product) = try_readability(html, base_url) {
         let confidence = calculate_confidence(&product.content, &product.text, &full_text);
 
         if confidence >= 0.40 {
-            let non_ws_len = product.text.chars().filter(|c| !c.is_whitespace()).count();
-            let thin_content = non_ws_len < 200;
-            let word_count = product.text.split_whitespace().count();
-            let reading_time_minutes = if word_count == 0 {
-                0
-            } else {
-                ((word_count as f32 / 200.0).ceil() as u32).max(1)
-            };
-            let author = extract_author(html);
-            let published_date = extract_published_date(html);
-            let excerpt = extract_excerpt(html);
+            let thin_content = is_thin(&product.text);
+            let reading_time_minutes = reading_time_minutes(&product.text);
 
             return ExtractionResult {
                 title: Some(product.title),
-                author,
-                published_date,
-                excerpt,
+                author: extract_author(html),
+                published_date: extract_published_date(html),
+                excerpt: extract_excerpt(html),
                 body_html: product.content,
                 body_text: product.text,
                 reading_time_minutes,
@@ -85,6 +601,7 @@ pub fn extract_main_content(html: &str, base_url: &str) -> ExtractionResult {
                 thin_content,
                 extraction_failed: false,
                 method: "readability".to_string(),
+                page_type: None,
             };
         }
     }
@@ -93,23 +610,14 @@ pub fn extract_main_content(html: &str, base_url: &str) -> ExtractionResult {
     let css_confidence = calculate_confidence(&css.body_html, &css.body_text, &full_text);
 
     if css_confidence >= 0.25 {
-        let non_ws_len = css.body_text.chars().filter(|c| !c.is_whitespace()).count();
-        let thin_content = non_ws_len < 200;
-        let word_count = css.body_text.split_whitespace().count();
-        let reading_time_minutes = if word_count == 0 {
-            0
-        } else {
-            ((word_count as f32 / 200.0).ceil() as u32).max(1)
-        };
-        let author = extract_author(html);
-        let published_date = extract_published_date(html);
-        let excerpt = extract_excerpt(html);
+        let thin_content = is_thin(&css.body_text);
+        let reading_time_minutes = reading_time_minutes(&css.body_text);
 
         return ExtractionResult {
             title: css.title,
-            author,
-            published_date,
-            excerpt,
+            author: extract_author(html),
+            published_date: extract_published_date(html),
+            excerpt: extract_excerpt(html),
             body_html: css.body_html,
             body_text: css.body_text,
             reading_time_minutes,
@@ -117,22 +625,264 @@ pub fn extract_main_content(html: &str, base_url: &str) -> ExtractionResult {
             thin_content,
             extraction_failed: false,
             method: "css_selector".to_string(),
+            page_type: None,
         };
     }
 
+    let fallback = extract_largest_text_block(html);
+    let thin_content = is_thin(&fallback.body_text);
+    let reading_time_minutes = reading_time_minutes(&fallback.body_text);
+    let fallback_empty = fallback.body_text.trim().is_empty();
+
     ExtractionResult {
-        title: extract_title_tag(html),
+        title: fallback.title.or_else(|| extract_title_tag(html)),
+        author: extract_author(html),
+        published_date: extract_published_date(html),
+        excerpt: extract_excerpt(html),
+        body_html: fallback.body_html,
+        body_text: fallback.body_text,
+        reading_time_minutes,
+        confidence: if fallback_empty { 0.0 } else { 0.1 },
+        thin_content,
+        extraction_failed: fallback_empty,
+        method: "article_largest_block".to_string(),
+        page_type: None,
+    }
+}
+
+fn extract_spa(html: &str, _base_url: &str, structured: &StructuredData) -> ExtractionResult {
+    let full_text = extract_all_text(html);
+    let selectors = ["main", "[role=\"main\"]", "[role='main']"];
+    let mut css = try_css_selector_extraction_with_selectors(html, &selectors);
+
+    if css.body_text.trim().is_empty() {
+        css = extract_largest_text_block(html);
+    }
+
+    if css.body_text.trim().is_empty() && structured.description.is_some() {
+        css.body_text = structured.description.clone().unwrap_or_default();
+    }
+
+    let confidence = if css.body_text.trim().is_empty() {
+        0.0
+    } else {
+        calculate_confidence(&css.body_html, &css.body_text, &full_text)
+    };
+
+    let thin_content = is_thin(&css.body_text);
+    let reading_time_minutes = reading_time_minutes(&css.body_text);
+
+    let css_empty = css.body_text.trim().is_empty();
+
+    ExtractionResult {
+        title: css.title.or_else(|| extract_title_tag(html)),
         author: None,
         published_date: None,
-        excerpt: None,
+        excerpt: structured.description.clone(),
+        body_html: css.body_html,
+        body_text: css.body_text,
+        reading_time_minutes,
+        confidence,
+        thin_content,
+        extraction_failed: css_empty,
+        method: "spa_content".to_string(),
+        page_type: None,
+    }
+}
+
+fn extract_product(html: &str, _base_url: &str, structured: &StructuredData) -> ExtractionResult {
+    let is_product = structured
+        .page_type
+        .as_deref()
+        .map(|t| t.eq_ignore_ascii_case("product"))
+        .unwrap_or(false)
+        || extract_jsonld_types(html)
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case("product"));
+
+    if is_product {
+        let body_text = structured
+            .body_text
+            .clone()
+            .or_else(|| structured.description.clone())
+            .unwrap_or_default();
+        let thin_content = is_thin(&body_text);
+        let reading_time_minutes = reading_time_minutes(&body_text);
+
+        return ExtractionResult {
+            title: structured.title.clone().or_else(|| extract_title_tag(html)),
+            author: structured.author.clone(),
+            published_date: structured.date_published.clone(),
+            excerpt: structured.description.clone(),
+            body_html: String::new(),
+            body_text,
+            reading_time_minutes,
+            confidence: 0.85,
+            thin_content,
+            extraction_failed: false,
+            method: "jsonld_product".to_string(),
+            page_type: None,
+        };
+    }
+
+    let document = Html::parse_document(html);
+    let title = select_text_from_selectors(
+        &document,
+        &["[itemprop=\"name\"]", ".product-title"],
+    )
+    .or_else(|| extract_title_tag(html));
+    let body_text = select_text_from_selectors(
+        &document,
+        &["[itemprop=\"description\"]", ".product-description"],
+    )
+    .unwrap_or_default();
+    let body_html = select_html_from_selectors(
+        &document,
+        &["[itemprop=\"description\"]", ".product-description"],
+    )
+    .unwrap_or_default();
+
+    let thin_content = is_thin(&body_text);
+    let reading_time_minutes = reading_time_minutes(&body_text);
+    let body_text_empty = body_text.trim().is_empty();
+
+    ExtractionResult {
+        title,
+        author: structured.author.clone(),
+        published_date: structured.date_published.clone(),
+        excerpt: structured.description.clone(),
+        body_html,
+        body_text,
+        reading_time_minutes,
+        confidence: 0.25,
+        thin_content,
+        extraction_failed: body_text_empty,
+        method: "css_product".to_string(),
+        page_type: None,
+    }
+}
+
+fn extract_navigation(html: &str, _base_url: &str, structured: &StructuredData) -> ExtractionResult {
+    ExtractionResult {
+        title: structured.title.clone().or_else(|| extract_title_tag(html)),
+        author: None,
+        published_date: None,
+        excerpt: structured.description.clone(),
         body_html: String::new(),
         body_text: String::new(),
         reading_time_minutes: 0,
         confidence: 0.0,
         thin_content: true,
-        extraction_failed: true,
-        method: "failed".to_string(),
+        extraction_failed: false,
+        method: "navigation_index".to_string(),
+        page_type: None,
     }
+}
+
+fn extract_gallery(html: &str, _base_url: &str, structured: &StructuredData) -> ExtractionResult {
+    let document = Html::parse_document(html);
+    let mut parts = Vec::new();
+
+    if let Ok(sel) = Selector::parse("figcaption") {
+        for el in document.select(&sel) {
+            let text: String = el.text().collect::<Vec<_>>().join("");
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                parts.push(trimmed.to_string());
+            }
+        }
+    }
+
+    if let Ok(sel) = Selector::parse("img[alt]") {
+        for el in document.select(&sel) {
+            if let Some(alt) = el.value().attr("alt") {
+                let trimmed = alt.trim();
+                if !trimmed.is_empty() {
+                    parts.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    let body_text = parts.join("\n");
+    let thin_content = is_thin(&body_text);
+    let reading_time_minutes = reading_time_minutes(&body_text);
+
+    ExtractionResult {
+        title: structured.title.clone().or_else(|| extract_title_tag(html)),
+        author: None,
+        published_date: None,
+        excerpt: structured.description.clone(),
+        body_html: String::new(),
+        body_text,
+        reading_time_minutes,
+        confidence: 0.2,
+        thin_content,
+        extraction_failed: parts.is_empty(),
+        method: "gallery_captions".to_string(),
+        page_type: None,
+    }
+}
+
+fn extract_unknown(html: &str, base_url: &str, _structured: &StructuredData) -> ExtractionResult {
+    let full_text = extract_all_text(html);
+
+    if let Some(product) = try_readability(html, base_url) {
+        let confidence = calculate_confidence(&product.content, &product.text, &full_text);
+        if confidence >= 0.40 {
+            let thin_content = is_thin(&product.text);
+            let reading_time_minutes = reading_time_minutes(&product.text);
+
+            return ExtractionResult {
+                title: Some(product.title),
+                author: extract_author(html),
+                published_date: extract_published_date(html),
+                excerpt: extract_excerpt(html),
+                body_html: product.content,
+                body_text: product.text,
+                reading_time_minutes,
+                confidence,
+                thin_content,
+                extraction_failed: false,
+                method: "unknown_readability".to_string(),
+                page_type: None,
+            };
+        }
+    }
+
+    let fallback = extract_largest_text_block(html);
+    let thin_content = is_thin(&fallback.body_text);
+    let reading_time_minutes = reading_time_minutes(&fallback.body_text);
+    let fallback_empty = fallback.body_text.trim().is_empty();
+
+    ExtractionResult {
+        title: fallback.title.or_else(|| extract_title_tag(html)),
+        author: extract_author(html),
+        published_date: extract_published_date(html),
+        excerpt: extract_excerpt(html),
+        body_html: fallback.body_html,
+        body_text: fallback.body_text,
+        reading_time_minutes,
+        confidence: if fallback_empty { 0.0 } else { 0.1 },
+        thin_content,
+        extraction_failed: fallback_empty,
+        method: "unknown_largest_block".to_string(),
+        page_type: None,
+    }
+}
+
+fn reading_time_minutes(text: &str) -> u32 {
+    let word_count = text.split_whitespace().count();
+    if word_count == 0 {
+        0
+    } else {
+        ((word_count as f32 / 200.0).ceil() as u32).max(1)
+    }
+}
+
+fn is_thin(text: &str) -> bool {
+    let non_ws_len = text.chars().filter(|c| !c.is_whitespace()).count();
+    non_ws_len < 200
 }
 
 fn text_to_tag_ratio(html: &str) -> f32 {
@@ -201,9 +951,6 @@ struct CssExtraction {
 }
 
 fn try_css_selector_extraction(html: &str) -> CssExtraction {
-    let document = Html::parse_document(html);
-    let title = extract_title_tag(html);
-
     let selectors_order: &[&str] = &[
         "article",
         "main",
@@ -211,6 +958,16 @@ fn try_css_selector_extraction(html: &str) -> CssExtraction {
         ".content",
         ".post",
     ];
+
+    try_css_selector_extraction_with_selectors(html, selectors_order)
+}
+
+fn try_css_selector_extraction_with_selectors(
+    html: &str,
+    selectors_order: &[&str],
+) -> CssExtraction {
+    let document = Html::parse_document(html);
+    let title = extract_title_tag(html);
 
     for selector_str in selectors_order {
         if let Ok(sel) = Selector::parse(selector_str) {
@@ -238,6 +995,80 @@ fn try_css_selector_extraction(html: &str) -> CssExtraction {
         body_html: String::new(),
         body_text: String::new(),
     }
+}
+
+fn extract_largest_text_block(html: &str) -> CssExtraction {
+    let document = Html::parse_document(html);
+    let title = extract_title_tag(html);
+
+    let selectors_order: &[&str] = &["main", "[role=\"main\"]", "article", "section", "div"]; 
+    let mut best_text = String::new();
+    let mut best_html = String::new();
+
+    for selector_str in selectors_order {
+        let Ok(sel) = Selector::parse(selector_str) else {
+            continue;
+        };
+        for el in document.select(&sel) {
+            let tag = el.value().name();
+            if tag == "nav" || tag == "header" || tag == "footer" || tag == "aside" {
+                continue;
+            }
+            let text_content: String = el.text().collect::<Vec<_>>().join("");
+            if text_content.trim().is_empty() {
+                continue;
+            }
+            if text_content.len() > best_text.len() {
+                use crate::crawler::sanitize_to_html;
+                best_text = text_content;
+                best_html = sanitize_to_html(&vec![el]);
+            }
+        }
+    }
+
+    CssExtraction {
+        title,
+        body_html: best_html,
+        body_text: best_text,
+    }
+}
+
+fn select_text_from_selectors(
+    document: &Html,
+    selectors: &[&str],
+) -> Option<String> {
+    for selector_str in selectors {
+        if let Ok(sel) = Selector::parse(selector_str) {
+            if let Some(el) = document.select(&sel).next() {
+                let text: String = el.text().collect::<Vec<_>>().join("");
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn select_html_from_selectors(
+    document: &Html,
+    selectors: &[&str],
+) -> Option<String> {
+    for selector_str in selectors {
+        if let Ok(sel) = Selector::parse(selector_str) {
+            let elements: Vec<_> = document.select(&sel).collect();
+            if elements.is_empty() {
+                continue;
+            }
+            use crate::crawler::sanitize_to_html;
+            let html_content = sanitize_to_html(&elements);
+            if !html_content.trim().is_empty() {
+                return Some(html_content);
+            }
+        }
+    }
+    None
 }
 
 fn extract_all_text(html: &str) -> String {
