@@ -24,6 +24,7 @@ import {
   AlertTriangle,
   FileDown,
   Zap,
+  Monitor,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useArchiver } from "@/hooks/useArchiver";
@@ -95,6 +96,9 @@ function extractionMethodBadge(method: string | null): React.ReactNode {
       return <span className="rounded px-1 py-0.5 text-[9px] bg-gray-700/50 text-gray-300 font-medium">css_selector</span>;
     case "zyte_autoextract":
       return <span className="inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[9px] bg-emerald-900/30 text-emerald-400 font-medium"><Zap className="h-2.5 w-2.5" />Zyte</span>;
+    case "readability (browser)":
+    case "css_selector (browser)":
+      return <span className="rounded px-1 py-0.5 text-[9px] bg-purple-900/30 text-purple-400 font-medium">browser</span>;
     case "failed":
     case "raw":
       return <span className="rounded px-1 py-0.5 text-[9px] bg-amber-900/30 text-amber-400 font-medium">{method}</span>;
@@ -502,6 +506,17 @@ export function ArchiverDashboard() {
                   </span>
                 </div>
               </div>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1.5 text-[11px]">
+                  <span
+                    className={`h-2 w-2 rounded-full ${archiver.appStatus?.chrome_available ? "bg-emerald-500" : "bg-gray-600"}`}
+                    title={archiver.appStatus?.chrome_available ? "Chrome ?" : "No Chrome — deep fetch unavailable"}
+                  />
+                  <span className="text-gray-400">
+                    {archiver.appStatus?.chrome_available ? "Chrome ?" : "No Chrome — deep fetch unavailable"}
+                  </span>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -586,6 +601,7 @@ export function ArchiverDashboard() {
               onExportPage={(page) => openExportPanel("single_page", page)}
               onExportCrawl={(crawlId) => openExportPanel("whole_crawl", null, crawlId)}
               zyteAvailable={archiver.appStatus?.zyte_available === true}
+              chromeAvailable={archiver.appStatus?.chrome_available === true}
             />
             <ExportPanel
               open={exportPanelOpen}
@@ -885,7 +901,7 @@ function DetailDrawer({
           </div>
           {page.deep_fetched && (
             <span className="inline-flex items-center gap-1 rounded-md bg-emerald-900/20 px-2.5 py-1.5 text-xs text-emerald-400 border border-emerald-800/40">
-              <CheckCircle2 className="h-3.5 w-3.5" />
+              <Monitor className="h-3.5 w-3.5" />
               Deep Fetched
             </span>
           )}
@@ -985,7 +1001,7 @@ function CrawlSummaryPanel({
         {summary.deep_fetched_count > 0 && (
           <>
             {" "}&middot;{" "}
-            <span className="text-emerald-400">Deep fetched: {summary.deep_fetched_count} pages via Zyte</span>
+            <span className="text-emerald-400">Auto deep-fetched: {summary.deep_fetched_count} pages (headless browser)</span>
           </>
         )}
       </div>
@@ -1142,6 +1158,7 @@ function ArchiveViewer({
   onExportPage,
   onExportCrawl,
   zyteAvailable,
+  chromeAvailable,
 }: {
   pages: PageSummary[];
   loading: boolean;
@@ -1150,6 +1167,7 @@ function ArchiveViewer({
   onExportPage: (page: PageSummary) => void;
   onExportCrawl: (crawlId: string) => void;
   zyteAvailable: boolean;
+  chromeAvailable: boolean;
 }) {
   const [previewPage, setPreviewPage] = useState<PageSummary | null>(null);
   const [previewContent, setPreviewContent] = useState<string | null>(null);
@@ -1297,8 +1315,8 @@ function ArchiveViewer({
                   <div className="flex items-center gap-1">
                     {extractionMethodBadge(page.extraction_method)}
                     {page.deep_fetched && (
-                      <span className="inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[9px] bg-emerald-900/20 text-emerald-400">
-                        <CheckCircle2 className="h-2.5 w-2.5" />
+                      <span className="inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[9px] bg-purple-900/20 text-purple-400">
+                        <Monitor className="h-2.5 w-2.5" />
                       </span>
                     )}
                   </div>
@@ -1311,12 +1329,12 @@ function ArchiveViewer({
                 </td>
                 <td className="px-3 py-2 text-right">
                   <div className="flex items-center justify-end gap-1">
-                    {page.thin_content && zyteAvailable && !page.deep_fetched && (
+                    {page.thin_content && (zyteAvailable || chromeAvailable) && !page.deep_fetched && (
                       <button
                         onClick={(e) => { e.stopPropagation(); handleDeepFetch(page); }}
                         disabled={deepFetchingUrl === page.url}
-                        className="rounded px-1 py-0.5 text-[10px] bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600/30 transition-colors disabled:opacity-50"
-                        title="Deep fetch with Zyte browser rendering"
+                        className="rounded px-1 py-0.5 text-[10px] bg-purple-600/20 text-purple-400 hover:bg-purple-600/30 transition-colors disabled:opacity-50"
+                        title={chromeAvailable ? "Deep fetch with headless browser" : "Deep fetch with Zyte browser rendering"}
                       >
                         {deepFetchingUrl === page.url ? <Loader2 className="h-3 w-3 animate-spin" /> : <Zap className="h-3 w-3" />}
                       </button>

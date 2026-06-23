@@ -850,6 +850,7 @@ pub struct PageSummary {
     pub extraction_confidence: Option<f32>,
     pub thin_content: Option<bool>,
     pub deep_fetched: Option<bool>,
+    pub deep_fetch_duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1017,6 +1018,9 @@ pub fn parse_jl_pages(
         let deep_fetched = item
             .get("deep_fetched")
             .and_then(|v| v.as_bool());
+        let deep_fetch_duration_ms = item
+            .get("deep_fetch_duration_ms")
+            .and_then(|v| v.as_u64());
 
         pages.push(PageSummary {
             url,
@@ -1046,6 +1050,7 @@ pub fn parse_jl_pages(
             extraction_confidence,
             thin_content,
             deep_fetched,
+            deep_fetch_duration_ms,
         });
     }
 
@@ -1181,6 +1186,7 @@ pub async fn list_archived_pages(
             extraction_confidence: doc.extraction_confidence,
             thin_content: doc.thin_content,
             deep_fetched: doc.deep_fetched,
+            deep_fetch_duration_ms: doc.deep_fetch_duration_ms,
         });
         }
     }
@@ -1402,6 +1408,9 @@ async fn get_page_doc(
                             deep_fetched: item
                                 .get("deep_fetched")
                                 .and_then(|v| v.as_bool()),
+                            deep_fetch_duration_ms: item
+                                .get("deep_fetch_duration_ms")
+                                .and_then(|v| v.as_u64()),
                         };
                         return Ok(Some(page_doc));
                     }
@@ -1585,6 +1594,7 @@ pub async fn export_content(
                                 extraction_confidence: item.get("extraction_confidence").and_then(|v| v.as_f64()).map(|v| v as f32),
                                 thin_content: item.get("thin_content").and_then(|v| v.as_bool()),
                                 deep_fetched: item.get("deep_fetched").and_then(|v| v.as_bool()),
+                                deep_fetch_duration_ms: item.get("deep_fetch_duration_ms").and_then(|v| v.as_u64()),
                             };
                             docs.push(pd);
                         }
@@ -1722,107 +1732,215 @@ pub async fn deep_fetch_page(
 ) -> Result<PageSummary, String> {
     crate::ssrf::validate_seed_url(&url).await?;
 
-    let zyte = ctx
-        .zyte
-        .as_ref()
-        .ok_or("Zyte not configured — set ZYTE_API_KEY to enable deep fetch")?;
+    if ctx.deep_fetch_config.chrome_available {
+        let _permit = ctx.deep_fetch_queue.acquire().await?;
 
-    let _permit = ctx.deep_fetch_queue.acquire().await?;
+        let start = std::time::Instant::now();
+        let browser = crate::headless::HeadlessBrowser::launch(
+            crate::headless::HeadlessConfig::default(),
+        )
+        .await
+        .map_err(|e| format!("Failed to launch headless browser: {}", e))?;
 
-    let result = zyte.deep_fetch(&url, &ctx.http).await?;
+        let rendered = browser
+            .render_page(&url)
+            .await
+            .map_err(|e| format!("Headless render failed: {}", e))?;
 
-    let extraction = if let Some(ref article) = result.article {
-        crate::zyte::zyte_article_to_extraction(article, &result.browser_html, &url)
-    } else {
-        tokio::task::spawn_blocking({
-            let html = result.browser_html.clone();
-            let url = url.clone();
-            move || {
-                let er = crate::extraction::extract_main_content(&html, &url);
-                crate::extraction::ZyteExtractionResult {
-                    title: er.title,
-                    author: er.author,
-                    published_date: er.published_date,
-                    excerpt: er.excerpt,
-                    body_html: er.body_html,
-                    body_text: er.body_text,
-                    reading_time_minutes: er.reading_time_minutes,
-                    confidence: er.confidence,
-                    method: er.method.clone(),
-                    thin_content: er.thin_content,
-                }
-            }
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let html = rendered.html;
+        let url_for_extract = url.clone();
+        let extraction = tokio::task::spawn_blocking(move || {
+            crate::extraction::extract_main_content(&html, &url_for_extract)
         })
         .await
-        .map_err(|e| e.to_string())?
-    };
+        .map_err(|e| format!("Extraction task failed: {}", e))?;
 
-    if let Some(store) = &ctx.store {
-        let filter = mongodb::bson::doc! {
-            "url": &url,
-            "crawl_id": &crawl_id,
+        let method_label = if extraction.method == "readability" || extraction.method == "css_selector" {
+            format!("{} (browser)", extraction.method)
+        } else {
+            extraction.method.clone()
         };
-        let update = mongodb::bson::doc! {
-            "$set": {
-                "body_html": &extraction.body_html,
-                "body_text": &extraction.body_text,
-                "extraction_method": &extraction.method,
-                "extraction_confidence": extraction.confidence,
-                "thin_content": extraction.thin_content,
-                "deep_fetched": true,
+
+        if let Some(store) = &ctx.store {
+            if !crawl_id.is_empty() {
+                let filter = mongodb::bson::doc! {
+                    "url": &url,
+                    "crawl_id": &crawl_id,
+                };
+                let update = mongodb::bson::doc! {
+                    "$set": {
+                        "body_html": &extraction.body_html,
+                        "body_text": &extraction.body_text,
+                        "extraction_method": &method_label,
+                        "extraction_confidence": extraction.confidence,
+                        "thin_content": extraction.thin_content,
+                        "deep_fetched": true,
+                        "deep_fetch_duration_ms": duration_ms as i64,
+                    }
+                };
+                let options = mongodb::options::UpdateOptions::builder().build();
+                let _ = store
+                    .pages_col()
+                    .update_one(filter, update)
+                    .with_options(options)
+                    .await;
             }
+        }
+
+        browser.close();
+
+        let emitter = CraspEmitter::Tauri(TauriEmitter::new(app));
+        let _ = emit_log(
+            &emitter,
+            "info",
+            "local",
+            &format!(
+                "Manual deep fetch (browser) complete for {} — method={}, confidence={:.2}, thin={}, duration={}ms",
+                url, method_label, extraction.confidence, extraction.thin_content, duration_ms
+            ),
+        )
+        .await;
+
+        Ok(PageSummary {
+            url: url.clone(),
+            title: String::new(),
+            depth: 0,
+            stage: "Completed".to_string(),
+            status_reason: None,
+            content_size: 0,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            source: StorageSource::Mongo,
+            content_preview: None,
+            extracted_title: extraction.title,
+            author: extraction.author,
+            published_date: extraction.published_date,
+            excerpt: extraction.excerpt,
+            reading_time_minutes: if extraction.reading_time_minutes > 0 {
+                Some(extraction.reading_time_minutes)
+            } else {
+                None
+            },
+            body_text: if !extraction.body_text.is_empty() {
+                Some(extraction.body_text)
+            } else {
+                None
+            },
+            body_html: if !extraction.body_html.is_empty() {
+                Some(extraction.body_html)
+            } else {
+                None
+            },
+            assets: None,
+            extraction_method: Some(method_label),
+            extraction_confidence: Some(extraction.confidence),
+            thin_content: Some(extraction.thin_content),
+            deep_fetched: Some(true),
+            deep_fetch_duration_ms: Some(duration_ms),
+        })
+    } else if let Some(zyte) = ctx.zyte.as_ref() {
+        let _permit = ctx.deep_fetch_queue.acquire().await?;
+
+        let result = zyte.deep_fetch(&url, &ctx.http).await?;
+
+        let extraction = if let Some(ref article) = result.article {
+            crate::zyte::zyte_article_to_extraction(article, &result.browser_html, &url)
+        } else {
+            tokio::task::spawn_blocking({
+                let html = result.browser_html.clone();
+                let url = url.clone();
+                move || {
+                    let er = crate::extraction::extract_main_content(&html, &url);
+                    crate::extraction::ZyteExtractionResult {
+                        title: er.title,
+                        author: er.author,
+                        published_date: er.published_date,
+                        excerpt: er.excerpt,
+                        body_html: er.body_html,
+                        body_text: er.body_text,
+                        reading_time_minutes: er.reading_time_minutes,
+                        confidence: er.confidence,
+                        method: er.method.clone(),
+                        thin_content: er.thin_content,
+                    }
+                }
+            })
+            .await
+            .map_err(|e| e.to_string())?
         };
-        let options = mongodb::options::UpdateOptions::builder().build();
-        let _ = store
-            .pages_col()
-            .update_one(filter, update)
-            .with_options(options)
-            .await;
+
+        if let Some(store) = &ctx.store {
+            if !crawl_id.is_empty() {
+                let filter = mongodb::bson::doc! {
+                    "url": &url,
+                    "crawl_id": &crawl_id,
+                };
+                let update = mongodb::bson::doc! {
+                    "$set": {
+                        "body_html": &extraction.body_html,
+                        "body_text": &extraction.body_text,
+                        "extraction_method": &extraction.method,
+                        "extraction_confidence": extraction.confidence,
+                        "thin_content": extraction.thin_content,
+                        "deep_fetched": true,
+                    }
+                };
+                let options = mongodb::options::UpdateOptions::builder().build();
+                let _ = store
+                    .pages_col()
+                    .update_one(filter, update)
+                    .with_options(options)
+                    .await;
+            }
+        }
+
+        let emitter = CraspEmitter::Tauri(TauriEmitter::new(app));
+        let _ = emit_log(
+            &emitter,
+            "info",
+            "local",
+            &format!(
+                "Manual deep fetch complete for {} — method={}, confidence={:.2}, thin={}",
+                url, extraction.method, extraction.confidence, extraction.thin_content
+            ),
+        )
+        .await;
+
+        Ok(PageSummary {
+            url: url.clone(),
+            title: String::new(),
+            depth: 0,
+            stage: "Completed".to_string(),
+            status_reason: None,
+            content_size: 0,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            source: StorageSource::Mongo,
+            content_preview: None,
+            extracted_title: extraction.title,
+            author: extraction.author,
+            published_date: extraction.published_date,
+            excerpt: extraction.excerpt,
+            reading_time_minutes: Some(extraction.reading_time_minutes),
+            body_text: if !extraction.body_text.is_empty() {
+                Some(extraction.body_text)
+            } else {
+                None
+            },
+            body_html: if !extraction.body_html.is_empty() {
+                Some(extraction.body_html)
+            } else {
+                None
+            },
+            assets: None,
+            extraction_method: Some(extraction.method),
+            extraction_confidence: Some(extraction.confidence),
+            thin_content: Some(extraction.thin_content),
+            deep_fetched: Some(true),
+            deep_fetch_duration_ms: None,
+        })
+    } else {
+        Err("Chrome not found and Zyte not configured — install Chrome or set ZYTE_API_KEY to enable deep fetch".to_string())
     }
-
-    let emitter = CraspEmitter::Tauri(TauriEmitter::new(app));
-    let _ = emit_log(
-        &emitter,
-        "info",
-        "local",
-        &format!(
-            "Manual deep fetch complete for {} — method={}, confidence={:.2}, thin={}",
-            url, extraction.method, extraction.confidence, extraction.thin_content
-        ),
-    )
-    .await;
-
-    Ok(PageSummary {
-        url: url.clone(),
-        title: String::new(),
-        depth: 0,
-        stage: "Completed".to_string(),
-        status_reason: None,
-        content_size: 0,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        source: StorageSource::Mongo,
-        content_preview: None,
-        extracted_title: extraction.title,
-        author: extraction.author,
-        published_date: extraction.published_date,
-        excerpt: extraction.excerpt,
-        reading_time_minutes: Some(extraction.reading_time_minutes),
-        body_text: if !extraction.body_text.is_empty() {
-            Some(extraction.body_text)
-        } else {
-            None
-        },
-        body_html: if !extraction.body_html.is_empty() {
-            Some(extraction.body_html)
-        } else {
-            None
-        },
-        assets: None,
-        extraction_method: Some(extraction.method),
-        extraction_confidence: Some(extraction.confidence),
-        thin_content: Some(extraction.thin_content),
-        deep_fetched: Some(true),
-    })
 }
 
 #[tauri::command]

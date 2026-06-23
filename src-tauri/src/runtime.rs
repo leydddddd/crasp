@@ -23,6 +23,7 @@ pub struct AppStatus {
     pub zyte_project: Option<String>,
     pub zyte_available: bool,
     pub deep_fetch_enabled: bool,
+    pub chrome_available: bool,
 }
 
 pub struct AppContext {
@@ -187,6 +188,7 @@ impl AppContext {
             zyte_project: self.zyte_project.clone(),
             zyte_available: self.zyte.is_some(),
             deep_fetch_enabled: self.deep_fetch_config.enabled,
+            chrome_available: self.deep_fetch_config.chrome_available,
         }
     }
 }

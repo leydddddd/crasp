@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod crawler;
 pub mod extraction;
+pub mod headless;
 pub mod local_scrapy;
 pub mod logging;
 pub mod progress;

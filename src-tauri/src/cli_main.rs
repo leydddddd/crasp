@@ -113,13 +113,16 @@ enum Commands {
         url: String,
     },
 
-    #[command(about = "Deep fetch a single URL using Zyte browser rendering")]
+    #[command(about = "Deep fetch a single URL using headless browser or Zyte rendering")]
     DeepFetch {
         #[arg(long, help = "URL to deep fetch")]
         url: String,
 
         #[arg(long, help = "Crawl ID to update the page record in")]
         crawl_id: Option<String>,
+
+        #[arg(long, default_value = "3000", help = "Wait time for JS to settle (ms)")]
+        wait_ms: u64,
     },
 
     #[command(about = "Test Zyte API browser rendering access")]
@@ -356,6 +359,7 @@ async fn run_crawl(
                 extraction_confidence: None,
                 thin_content: None,
                 deep_fetched: None,
+                deep_fetch_duration_ms: None,
             }).collect::<Vec<_>>()
         })
     } else {
@@ -461,6 +465,7 @@ async fn run_list(
                     extraction_confidence: doc.extraction_confidence,
                     thin_content: doc.thin_content,
                     deep_fetched: doc.deep_fetched,
+                    deep_fetch_duration_ms: doc.deep_fetch_duration_ms,
                 });
             }
         }
@@ -922,6 +927,7 @@ async fn load_page_docs_for_export(ctx: &Arc<crasp_lib::runtime::AppContext>, cr
                         extraction_confidence: item.get("extraction_confidence").and_then(|v| v.as_f64()).map(|v| v as f32),
                         thin_content: item.get("thin_content").and_then(|v| v.as_bool()),
                         deep_fetched: item.get("deep_fetched").and_then(|v| v.as_bool()),
+                        deep_fetch_duration_ms: item.get("deep_fetch_duration_ms").and_then(|v| v.as_u64()),
                     });
                 }
             }
@@ -1109,27 +1115,13 @@ async fn run_validate(url: &str) -> i32 {
     }
 }
 
-async fn run_deep_fetch(cli: &Cli, url: &str, crawl_id: Option<&str>) -> i32 {
+async fn run_deep_fetch(cli: &Cli, url: &str, crawl_id: Option<&str>, wait_ms: u64) -> i32 {
     if let Err(e) = crasp_lib::ssrf::validate_seed_url(url).await {
         eprintln!("{} Rejected — {}", "✗".red().bold(), e);
         return 1;
     }
 
     let ctx = build_app_context(cli.mongo_uri.clone()).await;
-
-    let zyte = match &ctx.zyte {
-        Some(c) => c,
-        None => {
-            eprintln!("{} ZYTE_API_KEY not configured", "✗".red().bold());
-            return 1;
-        }
-    };
-
-    if !ctx.deep_fetch_config.enabled {
-        eprintln!("{} Deep fetch not enabled — set CRASP_DEEP_FETCH_ENABLED=true", "⚠".yellow());
-    }
-
-    eprintln!("{} Deep fetching {}...", "→".blue(), url);
 
     let _permit = match ctx.deep_fetch_queue.acquire().await {
         Ok(p) => p,
@@ -1139,64 +1131,141 @@ async fn run_deep_fetch(cli: &Cli, url: &str, crawl_id: Option<&str>) -> i32 {
         }
     };
 
-    match zyte.deep_fetch(url, &ctx.http).await {
-        Ok(result) => {
-            let extraction = if let Some(ref article) = result.article {
-                crasp_lib::zyte::zyte_article_to_extraction(article, &result.browser_html, url)
-            } else {
-                let er = crasp_lib::extraction::extract_main_content(&result.browser_html, url);
-                crasp_lib::extraction::ZyteExtractionResult {
-                    title: er.title,
-                    author: er.author,
-                    published_date: er.published_date,
-                    excerpt: er.excerpt,
-                    body_html: er.body_html,
-                    body_text: er.body_text,
-                    reading_time_minutes: er.reading_time_minutes,
-                    confidence: er.confidence,
-                    method: er.method.clone(),
-                    thin_content: er.thin_content,
-                }
-            };
+    if ctx.deep_fetch_config.chrome_available {
+        eprintln!("{} Launching headless browser...", "→".blue());
+        eprintln!("{} Navigating to {}...", "→".blue(), url);
+        eprintln!("{} Rendering (waiting {}ms for JS to settle)...", "→".blue(), wait_ms);
 
-            if let Some(cid) = crawl_id {
-                if let Some(store) = &ctx.store {
-                    let filter = mongodb::bson::doc! { "url": url, "crawl_id": cid };
-                    let update = mongodb::bson::doc! {
-                        "$set": {
-                            "body_html": &extraction.body_html,
-                            "body_text": &extraction.body_text,
-                            "extraction_method": &extraction.method,
-                            "extraction_confidence": extraction.confidence,
-                            "thin_content": extraction.thin_content,
-                            "deep_fetched": true,
-                        }
-                    };
-                    let options = mongodb::options::UpdateOptions::builder().build();
-                    let _ = store.pages_col().update_one(filter, update).with_options(options).await;
-                }
+        let start = std::time::Instant::now();
+        let mut config = crasp_lib::headless::HeadlessConfig::default();
+        config.wait_for_idle_ms = wait_ms / 2;
+        config.timeout_ms = wait_ms * 10;
+
+        let browser = match crasp_lib::headless::HeadlessBrowser::launch(config).await {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("{} Failed to launch browser: {}", "✗".red().bold(), e);
+                return 1;
             }
+        };
 
-            println!("{} Deep fetch complete", "✓".green().bold());
-            println!("  Method:     {}", extraction.method);
-            println!("  Confidence: {:.2}", extraction.confidence);
-            println!("  Thin:       {}", extraction.thin_content);
-            println!("  Body text:  {} chars", extraction.body_text.len());
-            println!("  Body HTML:  {} chars", extraction.body_html.len());
-            println!("  Headline:   {}", extraction.title.as_deref().unwrap_or("(none)"));
-            println!("  Author:     {}", extraction.author.as_deref().unwrap_or("(none)"));
-            if result.article.is_some() {
-                println!("  AutoExtract: yes (structured article data)");
-            } else {
-                println!("  AutoExtract: no (readability fallback on browserHtml)");
+        let rendered = match browser.render_page(url).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{} Render failed: {}", "✗".red().bold(), e);
+                browser.close();
+                return 1;
             }
+        };
 
-            0
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let html = rendered.html;
+        let url_for_extract = url.to_string();
+        let extraction = tokio::task::spawn_blocking(move || {
+            crasp_lib::extraction::extract_main_content(&html, &url_for_extract)
+        })
+        .await
+        .unwrap_or_else(|_| crasp_lib::extraction::ExtractionResult::raw_fallback());
+
+        let method_label = if extraction.method == "readability" || extraction.method == "css_selector" {
+            format!("{} (browser)", extraction.method)
+        } else {
+            extraction.method.clone()
+        };
+
+        if let Some(cid) = crawl_id {
+            if let Some(store) = &ctx.store {
+                let filter = mongodb::bson::doc! { "url": url, "crawl_id": cid };
+                let update = mongodb::bson::doc! {
+                    "$set": {
+                        "body_html": &extraction.body_html,
+                        "body_text": &extraction.body_text,
+                        "extraction_method": &method_label,
+                        "extraction_confidence": extraction.confidence,
+                        "thin_content": extraction.thin_content,
+                        "deep_fetched": true,
+                        "deep_fetch_duration_ms": duration_ms as i64,
+                    }
+                };
+                let options = mongodb::options::UpdateOptions::builder().build();
+                let _ = store.pages_col().update_one(filter, update).with_options(options).await;
+            }
         }
-        Err(e) => {
-            eprintln!("{} Deep fetch failed: {}", "✗".red().bold(), e);
-            1
+
+        browser.close();
+
+        println!("{} Deep fetch complete", "✓".green().bold());
+        println!("  Method:     {}", method_label);
+        println!("  Confidence: {:.2}", extraction.confidence);
+        println!("  Content:    {} chars", extraction.body_text.len());
+        println!("  Thin:       {}", extraction.thin_content);
+        println!("  Duration:   {}ms", duration_ms);
+        if let Some(cid) = crawl_id {
+            println!("  Updated:    crawl_id {}", cid);
         }
+
+        0
+    } else if let Some(zyte) = &ctx.zyte {
+        eprintln!("{} Deep fetching {} (Zyte API)...", "→".blue(), url);
+
+        match zyte.deep_fetch(url, &ctx.http).await {
+            Ok(result) => {
+                let extraction = if let Some(ref article) = result.article {
+                    crasp_lib::zyte::zyte_article_to_extraction(article, &result.browser_html, url)
+                } else {
+                    let er = crasp_lib::extraction::extract_main_content(&result.browser_html, url);
+                    crasp_lib::extraction::ZyteExtractionResult {
+                        title: er.title,
+                        author: er.author,
+                        published_date: er.published_date,
+                        excerpt: er.excerpt,
+                        body_html: er.body_html,
+                        body_text: er.body_text,
+                        reading_time_minutes: er.reading_time_minutes,
+                        confidence: er.confidence,
+                        method: er.method.clone(),
+                        thin_content: er.thin_content,
+                    }
+                };
+
+                if let Some(cid) = crawl_id {
+                    if let Some(store) = &ctx.store {
+                        let filter = mongodb::bson::doc! { "url": url, "crawl_id": cid };
+                        let update = mongodb::bson::doc! {
+                            "$set": {
+                                "body_html": &extraction.body_html,
+                                "body_text": &extraction.body_text,
+                                "extraction_method": &extraction.method,
+                                "extraction_confidence": extraction.confidence,
+                                "thin_content": extraction.thin_content,
+                                "deep_fetched": true,
+                            }
+                        };
+                        let options = mongodb::options::UpdateOptions::builder().build();
+                        let _ = store.pages_col().update_one(filter, update).with_options(options).await;
+                    }
+                }
+
+                println!("{} Deep fetch complete", "✓".green().bold());
+                println!("  Method:     {}", extraction.method);
+                println!("  Confidence: {:.2}", extraction.confidence);
+                println!("  Thin:       {}", extraction.thin_content);
+                println!("  Body text:  {} chars", extraction.body_text.len());
+                println!("  Body HTML:  {} chars", extraction.body_html.len());
+                println!("  Headline:   {}", extraction.title.as_deref().unwrap_or("(none)"));
+                println!("  Author:     {}", extraction.author.as_deref().unwrap_or("(none)"));
+
+                0
+            }
+            Err(e) => {
+                eprintln!("{} Deep fetch failed: {}", "✗".red().bold(), e);
+                1
+            }
+        }
+    } else {
+        eprintln!("{} Chrome not found and ZYTE_API_KEY not configured", "✗".red().bold());
+        eprintln!("  Install Chrome or set ZYTE_API_KEY to enable deep fetch");
+        1
     }
 }
 
@@ -1276,7 +1345,7 @@ fn main() {
             }
             Commands::DataDir => run_data_dir(),
             Commands::Validate { url } => run_validate(url).await,
-            Commands::DeepFetch { url, crawl_id } => run_deep_fetch(&cli, &url, crawl_id.as_deref()).await,
+            Commands::DeepFetch { url, crawl_id, wait_ms } => run_deep_fetch(&cli, &url, crawl_id.as_deref(), *wait_ms).await,
             Commands::TestZyteApi { url } => run_test_zyte_api(&cli, &url).await,
         }
     });

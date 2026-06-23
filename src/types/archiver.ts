@@ -105,6 +105,7 @@ export interface ArchivedPage {
   extraction_confidence: number | null;
   thin_content: boolean | null;
   deep_fetched: boolean | null;
+  deep_fetch_duration_ms: number | null;
 }
 
 export interface CrawlDiscoverPayload {
@@ -156,6 +157,7 @@ export interface AppStatus {
   zyte_project: string | null;
   zyte_available: boolean;
   deep_fetch_enabled: boolean;
+  chrome_available: boolean;
 }
 
 export interface CloudProgressPayload {
@@ -193,6 +195,7 @@ export interface PageSummary {
   extraction_confidence: number | null;
   thin_content: boolean | null;
   deep_fetched: boolean | null;
+  deep_fetch_duration_ms: number | null;
 }
 
 export interface MongoConnectionStatus {

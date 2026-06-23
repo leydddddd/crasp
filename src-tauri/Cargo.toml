@@ -47,6 +47,8 @@ clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 colored = "2"
 csv = "1"
+chromiumoxide = { version = "0.5", features = ["tokio-runtime"] }
+which = "6"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(mobile)"] }

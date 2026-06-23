@@ -106,6 +106,7 @@ pub struct ArchivedPage {
     pub extraction_confidence: Option<f32>,
     pub thin_content: Option<bool>,
     pub deep_fetched: Option<bool>,
+    pub deep_fetch_duration_ms: Option<u64>,
 }
 
 #[allow(dead_code)]
@@ -583,6 +584,7 @@ async fn process_page(
         extraction_confidence: None,
         thin_content: None,
         deep_fetched: None,
+        deep_fetch_duration_ms: None,
     };
 
     let _ = emitter.emit("scrape-progress", &serde_json::json!({
@@ -822,20 +824,114 @@ async fn run_deep_fetch_if_available(
 ) -> ArchivedPage {
     match ctx.deep_fetch_queue.acquire().await {
         Ok(_permit) => {
-            let _ = emit_log(
-                emitter,
-                "info",
-                "local",
-                &format!(
-                    "Deep fetch triggered for {} (thin content: {} chars)",
-                    page.url,
-                    page.body_text.as_deref().unwrap_or("").len()
-                ),
-            )
-            .await;
+            if ctx.deep_fetch_config.chrome_available {
+                let _ = emit_log(
+                    emitter,
+                    "info",
+                    "local",
+                    &format!(
+                        "Deep fetch (headless browser) triggered for {} (thin content: {} chars)",
+                        page.url,
+                        page.body_text.as_deref().unwrap_or("").len()
+                    ),
+                )
+                .await;
 
-            match ctx.zyte.as_ref() {
-                Some(zyte_client) => match zyte_client.deep_fetch(&page.url, &ctx.http).await {
+                let start = std::time::Instant::now();
+                match crate::headless::HeadlessBrowser::launch(
+                    crate::headless::HeadlessConfig::default(),
+                )
+                .await
+                {
+                    Ok(browser) => {
+                        match browser.render_page(&page.url).await {
+                            Ok(rendered) => {
+                                let duration_ms = start.elapsed().as_millis() as u64;
+                                let html = rendered.html;
+                                let url_for_extract = page.url.clone();
+                                let extraction = tokio::task::spawn_blocking(move || {
+                                    crate::extraction::extract_main_content(&html, &url_for_extract)
+                                })
+                                .await
+                                .unwrap_or_else(|_| crate::extraction::ExtractionResult::raw_fallback());
+
+                                page.body_html = if !extraction.body_html.is_empty() {
+                                    Some(extraction.body_html)
+                                } else {
+                                    page.body_html
+                                };
+                                page.body_text = if !extraction.body_text.is_empty() {
+                                    Some(extraction.body_text)
+                                } else {
+                                    page.body_text
+                                };
+                                page.extraction_method = if extraction.method.is_empty() {
+                                    page.extraction_method
+                                } else {
+                                    let m = if extraction.method == "readability" || extraction.method == "css_selector" {
+                                        format!("{} (browser)", extraction.method)
+                                    } else {
+                                        extraction.method
+                                    };
+                                    Some(m)
+                                };
+                                page.extraction_confidence = Some(extraction.confidence);
+                                page.thin_content = Some(extraction.thin_content);
+                                page.author = page.author.or(extraction.author);
+                                page.published_date = page.published_date.or(extraction.published_date);
+                                page.deep_fetched = Some(true);
+                                page.deep_fetch_duration_ms = Some(duration_ms);
+
+                                let _ = emit_log(
+                                    emitter,
+                                    "info",
+                                    "local",
+                                    &format!(
+                                        "Deep fetch (browser) completed for {} in {}ms — method={}, confidence={:.2}, thin={}",
+                                        page.url, duration_ms,
+                                        page.extraction_method.as_deref().unwrap_or("?"),
+                                        extraction.confidence,
+                                        extraction.thin_content
+                                    ),
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                let _ = emit_log(
+                                    emitter,
+                                    "warn",
+                                    "local",
+                                    &format!("Deep fetch (browser) render failed for {}: {}", page.url, e),
+                                )
+                                .await;
+                            }
+                        }
+                        browser.close();
+                    }
+                    Err(e) => {
+                        let _ = emit_log(
+                            emitter,
+                            "warn",
+                            "local",
+                            &format!("Deep fetch (browser) launch failed for {}: {}", page.url, e),
+                        )
+                        .await;
+                    }
+                }
+            } else if let Some(zyte_client) = ctx.zyte.as_ref() {
+                let _ = emit_log(
+                    emitter,
+                    "info",
+                    "local",
+                    &format!(
+                        "Deep fetch (Zyte) triggered for {} (thin content: {} chars)",
+                        page.url,
+                        page.body_text.as_deref().unwrap_or("").len()
+                    ),
+                )
+                .await;
+
+                match zyte_client.deep_fetch(&page.url, &ctx.http).await {
                     Ok(result) => {
                         let extraction =
                             if let Some(ref article) = result.article {
@@ -907,16 +1003,15 @@ async fn run_deep_fetch_if_available(
                         )
                         .await;
                     }
-                },
-                None => {
-                    let _ = emit_log(
-                        emitter,
-                        "warn",
-                        "local",
-                        "Deep fetch triggered but Zyte not configured — skipping",
-                    )
-                    .await;
                 }
+            } else {
+                let _ = emit_log(
+                    emitter,
+                    "warn",
+                    "local",
+                    "Deep fetch triggered but no Chrome binary or Zyte API configured — skipping",
+                )
+                .await;
             }
         }
         Err(e) => {

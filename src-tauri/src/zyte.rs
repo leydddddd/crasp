@@ -17,6 +17,7 @@ pub struct DeepFetchConfig {
     pub auto_trigger: bool,
     pub max_per_crawl: u32,
     pub request_delay_ms: u64,
+    pub chrome_available: bool,
 }
 
 impl Default for DeepFetchConfig {
@@ -26,26 +27,32 @@ impl Default for DeepFetchConfig {
             auto_trigger: false,
             max_per_crawl: 10,
             request_delay_ms: 2000,
+            chrome_available: false,
         }
     }
 }
 
 impl DeepFetchConfig {
     pub fn from_env() -> Self {
+        let chrome_available = crate::headless::find_chrome_binary().is_some();
+        let env_enabled = std::env::var("CRASP_DEEP_FETCH_ENABLED")
+            .ok()
+            .and_then(|v| v.to_lowercase().parse::<bool>().ok())
+            .unwrap_or(false);
+        let enabled = chrome_available && env_enabled;
         Self {
-            enabled: std::env::var("CRASP_DEEP_FETCH_ENABLED")
-                .ok()
-                .and_then(|v| v.to_lowercase().parse::<bool>().ok())
-                .unwrap_or(false),
-            auto_trigger: std::env::var("CRASP_DEEP_FETCH_AUTO")
-                .ok()
-                .and_then(|v| v.to_lowercase().parse::<bool>().ok())
-                .unwrap_or(false),
+            enabled,
+            auto_trigger: enabled
+                && std::env::var("CRASP_DEEP_FETCH_AUTO")
+                    .ok()
+                    .and_then(|v| v.to_lowercase().parse::<bool>().ok())
+                    .unwrap_or(false),
             max_per_crawl: std::env::var("CRASP_DEEP_FETCH_MAX")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(10),
             request_delay_ms: 2000,
+            chrome_available,
         }
     }
 }
