@@ -16,7 +16,7 @@ use phf::phf_set;
 
 use crate::commands::{persist_items_with_outcome, emit_persist_stages, SharedCrawlOutcomes};
 use crate::progress::CraspEmitter;
-use crate::logging::emit_log;
+use crate::logging::emit_log_with_crawl_id;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrawlConfig {
@@ -27,6 +27,8 @@ pub struct CrawlConfig {
     pub css_selectors: Vec<String>,
     pub preserve_html: bool,
     pub hash_algorithm: HashAlgorithm,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +48,7 @@ impl Default for CrawlConfig {
             css_selectors: vec!["article".into(), "main".into(), "body".into()],
             preserve_html: true,
             hash_algorithm: HashAlgorithm::Sha256,
+            allowed_urls: Vec::new(),
         }
     }
 }
@@ -374,6 +377,8 @@ impl Crawler {
         let i_scheme = scheme.clone();
         let i_emitter = emitter.clone();
         let i_cancelled = cancelled_flag.clone();
+        let i_allowed_urls: std::collections::HashSet<String> = config.allowed_urls.iter().cloned().collect();
+        let i_has_allowed_filter = !i_allowed_urls.is_empty();
 
         let collector = tokio::spawn(async move {
             while let Some(output) = done_rx.recv().await {
@@ -399,6 +404,10 @@ impl Crawler {
                         fragless_url.set_fragment(None);
                         let fragless = fragless_url.to_string();
                         let key = normalize_url(&fragless);
+
+                        if i_has_allowed_filter && !i_allowed_urls.contains(&fragless) {
+                            continue;
+                        }
 
                         let depth = archived.depth + 1;
                         if depth > i_max_depth {
@@ -487,7 +496,7 @@ impl Crawler {
                                 && ctx.deep_fetch_config.enabled
                                 && ctx.deep_fetch_config.auto_trigger
                             {
-                                p = run_deep_fetch_if_available(p, &ctx, &emitter_result).await;
+                                p = run_deep_fetch_if_available(p, &ctx, &emitter_result, &crawl_id_owned).await;
                             }
                             let _ = emitter_result.emit("archive-success", &serde_json::to_value(&p).unwrap_or_default()).await;
                             results.push(p.clone());
@@ -543,9 +552,9 @@ impl Crawler {
         let _ = collector.await;
 
         if was_cancelled {
-            let _ = emit_log(&emitter, "warn", "local", &format!("Crawl cancelled: id={}", crawl_id));
+            let _ = emit_log_with_crawl_id(&emitter, "warn", "local", &format!("Crawl cancelled: id={}", crawl_id), Some(crawl_id.to_string()));
         } else {
-            let _ = emit_log(&emitter, "info", "local", &format!("Crawl completed: id={}, pages={}", crawl_id, results.len()));
+            let _ = emit_log_with_crawl_id(&emitter, "info", "local", &format!("Crawl completed: id={}, pages={}", crawl_id, results.len()), Some(crawl_id.to_string()));
         }
 
         Ok(results)
@@ -612,7 +621,7 @@ async fn process_page(
             Ok(r) => r,
             Err(e) => {
                 page.status = PageStatus::Failed(e.to_string());
-                let _ = emit_log(emitter, "error", "local", &format!("Fetch failed for {}: {}", url_str, e));
+                let _ = emit_log_with_crawl_id(emitter, "error", "local", &format!("Fetch failed for {}: {}", url_str, e), Some(crawl_id.to_string()));
                 let _ = emitter.emit("page-stage", &serde_json::json!({
                     "url": url_str,
                     "crawl_id": crawl_id,
@@ -628,7 +637,7 @@ async fn process_page(
             Ok(r) => r,
             Err(e) => {
                 page.status = PageStatus::Failed(e.clone());
-                let _ = emit_log(emitter, "error", "local", &format!("SSRF redirect rejected for {}: {}", url_str, e));
+                let _ = emit_log_with_crawl_id(emitter, "error", "local", &format!("SSRF redirect rejected for {}: {}", url_str, e), Some(crawl_id.to_string()));
                 let _ = emitter.emit("page-stage", &serde_json::json!({
                     "url": url_str,
                     "crawl_id": crawl_id,
@@ -643,7 +652,7 @@ async fn process_page(
         if !status_code.is_success() {
             let reason = format!("HTTP {}", status_code);
             page.status = PageStatus::Failed(reason.clone());
-            let _ = emit_log(emitter, "warn", "local", &format!("Non-success HTTP {} for {}", status_code, url_str));
+            let _ = emit_log_with_crawl_id(emitter, "warn", "local", &format!("Non-success HTTP {} for {}", status_code, url_str), Some(crawl_id.to_string()));
             let _ = emitter.emit("page-stage", &serde_json::json!({
                 "url": url_str,
                 "crawl_id": crawl_id,
@@ -666,7 +675,7 @@ async fn process_page(
             }
             Err(e) => {
                 page.status = PageStatus::Failed(e.to_string());
-                let _ = emit_log(emitter, "error", "local", &format!("Body read failed for {}: {}", url_str, e));
+                let _ = emit_log_with_crawl_id(emitter, "error", "local", &format!("Body read failed for {}: {}", url_str, e), Some(crawl_id.to_string()));
                 let _ = emitter.emit("page-stage", &serde_json::json!({
                     "url": url_str,
                     "crawl_id": crawl_id,
@@ -770,19 +779,19 @@ async fn process_page(
         0
     };
 
-    let _ = emit_log(emitter, "info", "local", &format!(
+    let _ = emit_log_with_crawl_id(emitter, "info", "local", &format!(
         "Extraction: {} → method={}, confidence={:.2}, thin={}",
         url_str, extraction_method_str, extraction_confidence_val, is_thin
-    ));
+    ), Some(crawl_id.to_string()));
 
     if is_thin || extraction_failed_flag {
         let reason = if extraction_failed_flag { "extraction failed" } else { "may require JS rendering" };
-        let _ = emit_log(emitter, "warn", "local", &format!(
+        let _ = emit_log_with_crawl_id(emitter, "warn", "local", &format!(
             "Thin content detected on {} ({} chars) — {}",
             url_str,
             non_ws_count,
             reason
-        ));
+        ), Some(crawl_id.to_string()));
     }
 
     let _ = emitter.emit("crawl-discover", &serde_json::json!({
@@ -824,11 +833,12 @@ async fn run_deep_fetch_if_available(
     mut page: ArchivedPage,
     ctx: &Arc<crate::runtime::AppContext>,
     emitter: &CraspEmitter,
+    crawl_id: &str,
 ) -> ArchivedPage {
     match ctx.deep_fetch_queue.acquire().await {
         Ok(_permit) => {
             if ctx.deep_fetch_config.chrome_available {
-                let _ = emit_log(
+                let _ = emit_log_with_crawl_id(
                     emitter,
                     "info",
                     "local",
@@ -837,6 +847,7 @@ async fn run_deep_fetch_if_available(
                         page.url,
                         page.body_text.as_deref().unwrap_or("").len()
                     ),
+                    Some(crawl_id.to_string()),
                 )
                 .await;
 
@@ -886,7 +897,7 @@ async fn run_deep_fetch_if_available(
                                 page.deep_fetched = Some(true);
                                 page.deep_fetch_duration_ms = Some(duration_ms);
 
-                                let _ = emit_log(
+                                let _ = emit_log_with_crawl_id(
                                     emitter,
                                     "info",
                                     "local",
@@ -897,15 +908,17 @@ async fn run_deep_fetch_if_available(
                                         extraction.confidence,
                                         extraction.thin_content
                                     ),
+                                    Some(crawl_id.to_string()),
                                 )
                                 .await;
                             }
                             Err(e) => {
-                                let _ = emit_log(
+                                let _ = emit_log_with_crawl_id(
                                     emitter,
                                     "warn",
                                     "local",
                                     &format!("Deep fetch (browser) render failed for {}: {}", page.url, e),
+                                    Some(crawl_id.to_string()),
                                 )
                                 .await;
                             }
@@ -913,17 +926,18 @@ async fn run_deep_fetch_if_available(
                         browser.close();
                     }
                     Err(e) => {
-                        let _ = emit_log(
+                        let _ = emit_log_with_crawl_id(
                             emitter,
                             "warn",
                             "local",
                             &format!("Deep fetch (browser) launch failed for {}: {}", page.url, e),
+                            Some(crawl_id.to_string()),
                         )
                         .await;
                     }
                 }
             } else if let Some(zyte_client) = ctx.zyte.as_ref() {
-                let _ = emit_log(
+                let _ = emit_log_with_crawl_id(
                     emitter,
                     "info",
                     "local",
@@ -932,6 +946,7 @@ async fn run_deep_fetch_if_available(
                         page.url,
                         page.body_text.as_deref().unwrap_or("").len()
                     ),
+                    Some(crawl_id.to_string()),
                 )
                 .await;
 
@@ -1002,31 +1017,34 @@ async fn run_deep_fetch_if_available(
                         page.deep_fetched = Some(true);
                     }
                     Err(e) => {
-                        let _ = emit_log(
+                        let _ = emit_log_with_crawl_id(
                             emitter,
                             "warn",
                             "local",
                             &format!("Deep fetch failed for {}: {}", page.url, e),
+                            Some(crawl_id.to_string()),
                         )
                         .await;
                     }
                 }
             } else {
-                let _ = emit_log(
+                let _ = emit_log_with_crawl_id(
                     emitter,
                     "warn",
                     "local",
                     "Deep fetch triggered but no Chrome binary or Zyte API configured — skipping",
+                    Some(crawl_id.to_string()),
                 )
                 .await;
             }
         }
         Err(e) => {
-            let _ = emit_log(
+            let _ = emit_log_with_crawl_id(
                 emitter,
                 "warn",
                 "local",
                 &format!("Deep fetch skipped for {}: {}", page.url, e),
+                Some(crawl_id.to_string()),
             )
             .await;
         }
@@ -1047,7 +1065,7 @@ fn extract_title(document: &Html) -> String {
         .unwrap_or_default()
 }
 
-fn extract_links(document: &Html, base_url: &str) -> Vec<String> {
+pub fn extract_links(document: &Html, base_url: &str) -> Vec<String> {
     let selector = match Selector::parse("a[href]") {
         Ok(s) => s,
         Err(_) => return vec![],
@@ -1293,7 +1311,7 @@ fn compute_hash(content: &str, algorithm: &HashAlgorithm) -> String {
     }
 }
 
-fn normalize_url(url: &str) -> String {
+pub fn normalize_url(url: &str) -> String {
     let mut parsed = match Url::parse(url) {
         Ok(u) => u,
         Err(_) => return url.to_lowercase(),

@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import type {
@@ -22,6 +29,9 @@ import type {
   StorageSource,
   ExportRequest,
   ExportResult,
+  CrawlSummary,
+  AssetRow,
+  FrontierPreviewResult,
 } from "@/types/archiver";
 
 const MAX_QUEUE_DISPLAY = 500;
@@ -43,16 +53,26 @@ function formatStageName(stage: PageStage): string {
   if ("stage" in stage) {
     const s = stage.stage;
     switch (s) {
-      case "discovered": return "Discovered";
-      case "fetching": return "Fetching";
-      case "fetched": return `Fetched (${stage.status_code})`;
-      case "parsing": return "Parsing";
-      case "sanitizing": return "Sanitizing HTML";
-      case "preserving": return "Preserving content";
-      case "hashing": return "Computing hash";
-      case "persisting": return `Persisting → ${formatPersistTarget(stage.target)}`;
-      case "persisted": return `Persisted ✓ ${formatPersistTarget(stage.target)}`;
-      case "failed": return `Failed at ${stage.failed_stage}: ${stage.reason}`;
+      case "discovered":
+        return "Discovered";
+      case "fetching":
+        return "Fetching";
+      case "fetched":
+        return `Fetched (${stage.status_code})`;
+      case "parsing":
+        return "Parsing";
+      case "sanitizing":
+        return "Sanitizing HTML";
+      case "preserving":
+        return "Preserving content";
+      case "hashing":
+        return "Computing hash";
+      case "persisting":
+        return `Persisting → ${formatPersistTarget(stage.target)}`;
+      case "persisted":
+        return `Persisted ✓ ${formatPersistTarget(stage.target)}`;
+      case "failed":
+        return `Failed at ${stage.failed_stage}: ${stage.reason}`;
     }
   }
   return "Unknown";
@@ -94,10 +114,16 @@ export function useArchiver() {
   const [pageStageRev, bumpPageStage] = useReducer((c: number) => c + 1, 0);
 
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [logFilter, setLogFilter] = useState<{ level: string; engine: string; search: string }>({
+  const [logFilter, setLogFilter] = useState<{
+    level: string;
+    engine: string;
+    search: string;
+    crawl_id: string;
+  }>({
     level: "all",
     engine: "all",
     search: "",
+    crawl_id: "",
   });
   const [autoScroll, setAutoScroll] = useState(true);
 
@@ -119,41 +145,65 @@ export function useArchiver() {
   const testMongoConnection = useCallback(async (uri: string) => {
     setTestingMongo(true);
     try {
-      const result = await invoke<MongoConnectionStatus>("test_mongo_connection", { uri });
+      const result = await invoke<MongoConnectionStatus>(
+        "test_mongo_connection",
+        { uri },
+      );
       const newStatus = await invoke<AppStatus>("get_app_status");
       setAppStatus(newStatus);
       return result;
     } catch (e) {
-      return { ok: false, db_name: null, pages_count: null, message: String(e) } as MongoConnectionStatus;
+      return {
+        ok: false,
+        db_name: null,
+        pages_count: null,
+        message: String(e),
+      } as MongoConnectionStatus;
     } finally {
       setTestingMongo(false);
     }
   }, []);
 
-  const testZyteConnection = useCallback(async (apiKey: string, projectId: string) => {
-    setTestingZyte(true);
-    try {
-      const result = await invoke<ZyteConnectionStatus>("test_zyte_connection", {
-        apiKey,
-        projectId,
-      });
-      const newStatus = await invoke<AppStatus>("get_app_status");
-      setAppStatus(newStatus);
-      return result;
-    } catch (e) {
-      return { ok: false, project_name: null, message: String(e) } as ZyteConnectionStatus;
-    } finally {
-      setTestingZyte(false);
-    }
-  }, []);
+  const testZyteConnection = useCallback(
+    async (apiKey: string, projectId: string) => {
+      setTestingZyte(true);
+      try {
+        const result = await invoke<ZyteConnectionStatus>(
+          "test_zyte_connection",
+          {
+            apiKey,
+            projectId,
+          },
+        );
+        const newStatus = await invoke<AppStatus>("get_app_status");
+        setAppStatus(newStatus);
+        return result;
+      } catch (e) {
+        return {
+          ok: false,
+          project_name: null,
+          message: String(e),
+        } as ZyteConnectionStatus;
+      } finally {
+        setTestingZyte(false);
+      }
+    },
+    [],
+  );
 
   const [archivedPages, setArchivedPages] = useState<PageSummary[]>([]);
   const [loadingArchived, setLoadingArchived] = useState(false);
+  const [crawls, setCrawls] = useState<CrawlSummary[]>([]);
+  const [loadingCrawls, setLoadingCrawls] = useState(false);
+  const [activeCrawlId, setActiveCrawlId] = useState<string | null>(null);
+  const [crawlStartedAt, setCrawlStartedAt] = useState<string | null>(null);
 
   const loadArchivedPages = useCallback(async (crawlId?: string) => {
     setLoadingArchived(true);
     try {
-      const result = await invoke<PageSummary[]>("list_archived_pages", { crawlId: crawlId || null });
+      const result = await invoke<PageSummary[]>("list_archived_pages", {
+        crawlId: crawlId || null,
+      });
       const normalized: PageSummary[] = result.map((p) => ({
         ...p,
         source: serializeSource(p.source),
@@ -166,7 +216,35 @@ export function useArchiver() {
     }
   }, []);
 
-  const [crawlSummary, setCrawlSummary] = useState<CrawlDonePayload | null>(null);
+  const [crawlSummary, setCrawlSummary] = useState<CrawlDonePayload | null>(
+    null,
+  );
+
+  const loadCrawls = useCallback(async () => {
+    setLoadingCrawls(true);
+    try {
+      const result = await invoke<CrawlSummary[]>("list_crawls");
+      setCrawls(result);
+    } catch {
+      setCrawls([]);
+    } finally {
+      setLoadingCrawls(false);
+    }
+  }, []);
+
+  const renameCrawl = useCallback(
+    async (crawlId: string, name: string | null) => {
+      await invoke("rename_crawl", { crawlId, name });
+      setCrawls((prev) =>
+        prev.map((c) => (c.crawl_id === crawlId ? { ...c, name } : c)),
+      );
+    },
+    [],
+  );
+
+  const getCrawlDoc = useCallback(async (crawlId: string) => {
+    return invoke<CrawlSummary | null>("get_crawl_doc", { crawlId });
+  }, []);
 
   const openDataFolder = useCallback(async () => {
     try {
@@ -176,10 +254,13 @@ export function useArchiver() {
     }
   }, []);
 
-  const exportContent = useCallback(async (request: ExportRequest): Promise<ExportResult> => {
-    const result = await invoke<ExportResult>("export_content", { request });
-    return result;
-  }, []);
+  const exportContent = useCallback(
+    async (request: ExportRequest): Promise<ExportResult> => {
+      const result = await invoke<ExportResult>("export_content", { request });
+      return result;
+    },
+    [],
+  );
 
   const revealInExplorer = useCallback(async (path: string) => {
     try {
@@ -272,7 +353,9 @@ export function useArchiver() {
     let cancelled = false;
 
     const setup = async () => {
-      const listeners: Array<[string, (event: Record<string, unknown>) => void]> = [
+      const listeners: Array<
+        [string, (event: Record<string, unknown>) => void]
+      > = [
         [
           "scrape-progress",
           (event: Record<string, unknown>) => {
@@ -322,6 +405,7 @@ export function useArchiver() {
           (event: Record<string, unknown>) => {
             const payload = event.payload as CrawlDonePayload;
             setCrawlSummary(payload);
+            setActiveCrawlId(payload.crawl_id);
             setStatus((prev) => {
               if (prev === "crawling" || prev === "paused") {
                 return payload.cancelled ? "cancelled" : "completed";
@@ -420,9 +504,17 @@ export function useArchiver() {
 
   const filteredLogs = useMemo(() => {
     return logs.filter((entry) => {
-      if (logFilter.level !== "all" && entry.level !== logFilter.level) return false;
-      if (logFilter.engine !== "all" && entry.engine !== logFilter.engine) return false;
-      if (logFilter.search && !entry.message.toLowerCase().includes(logFilter.search.toLowerCase())) return false;
+      if (logFilter.level !== "all" && entry.level !== logFilter.level)
+        return false;
+      if (logFilter.engine !== "all" && entry.engine !== logFilter.engine)
+        return false;
+      if (
+        logFilter.search &&
+        !entry.message.toLowerCase().includes(logFilter.search.toLowerCase())
+      )
+        return false;
+      if (logFilter.crawl_id && entry.crawl_id !== logFilter.crawl_id)
+        return false;
       return true;
     });
   }, [logs, logFilter]);
@@ -449,6 +541,7 @@ export function useArchiver() {
     setError(null);
     setCrawlSummary(null);
     setStatus("crawling");
+    setCrawlStartedAt(new Date().toISOString());
 
     try {
       if (engine === "cloud") {
@@ -457,15 +550,18 @@ export function useArchiver() {
           setStatus("error");
           return;
         }
-        await invoke("start_cloud_crawl", {
+        const crawlId = await invoke<string>("start_cloud_crawl", {
           config,
           apiKey: zyteApiKey,
           projectId: zyteProjectId,
         });
+        setActiveCrawlId(crawlId);
       } else if (engine === "local-scrapy") {
-        await invoke("local_scrapy_crawl", { config });
+        const crawlId = await invoke<string>("local_scrapy_crawl", { config });
+        setActiveCrawlId(crawlId);
       } else {
-        await invoke("start_crawl", { config });
+        const crawlId = await invoke<string>("start_crawl", { config });
+        setActiveCrawlId(crawlId);
       }
     } catch (e) {
       setError(String(e));
@@ -512,10 +608,59 @@ export function useArchiver() {
     setError(null);
     setCrawlSummary(null);
     setStatus("idle");
+    setActiveCrawlId(null);
+    setCrawlStartedAt(null);
   }, []);
 
   const dismissSummary = useCallback(() => {
     setCrawlSummary(null);
+  }, []);
+
+  const [selectedPageUrls, setSelectedPageUrls] = useState<Set<string>>(new Set());
+
+  const togglePageSelection = useCallback((url: string) => {
+    setSelectedPageUrls((prev) => {
+      const next = new Set(prev);
+      if (next.has(url)) { next.delete(url); } else { next.add(url); }
+      return next;
+    });
+  }, []);
+
+  const clearPageSelection = useCallback(() => setSelectedPageUrls(new Set()), []);
+
+  const selectAllPages = useCallback((urls: string[]) => {
+    setSelectedPageUrls(new Set(urls));
+  }, []);
+
+  const previewFrontier = useCallback(async (seedUrl: string, maxPages: number): Promise<FrontierPreviewResult> => {
+    return invoke<FrontierPreviewResult>("preview_frontier", {
+      seedUrl,
+      maxPages,
+    });
+  }, []);
+
+  const listAssets = useCallback(async (crawlId: string): Promise<AssetRow[]> => {
+    return invoke<AssetRow[]>("list_assets", { crawlId });
+  }, []);
+
+  const exportLogs = useCallback(async (logsData: LogEntry[]): Promise<string> => {
+    const logsJson = JSON.stringify(logsData);
+    return invoke<string>("export_logs", { logsJson });
+  }, []);
+
+  const [assets, setAssets] = useState<AssetRow[]>([]);
+  const [loadingAssets, setLoadingAssets] = useState(false);
+
+  const loadAssets = useCallback(async (crawlId: string) => {
+    setLoadingAssets(true);
+    try {
+      const result = await invoke<AssetRow[]>("list_assets", { crawlId });
+      setAssets(result);
+    } catch {
+      setAssets([]);
+    } finally {
+      setLoadingAssets(false);
+    }
   }, []);
 
   return {
@@ -554,11 +699,28 @@ export function useArchiver() {
     archivedPages,
     loadingArchived,
     loadArchivedPages,
+    crawls,
+    loadingCrawls,
+    loadCrawls,
+    renameCrawl,
+    getCrawlDoc,
+    activeCrawlId,
+    crawlStartedAt,
     crawlSummary,
     dismissSummary,
     openDataFolder,
     exportContent,
     revealInExplorer,
+    previewFrontier,
+    listAssets,
+    exportLogs,
+    assets,
+    loadingAssets,
+    loadAssets,
+    selectedPageUrls,
+    togglePageSelection,
+    clearPageSelection,
+    selectAllPages,
   };
 }
 

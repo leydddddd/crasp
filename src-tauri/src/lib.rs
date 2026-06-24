@@ -38,12 +38,18 @@ pub fn run() {
             commands::test_zyte_connection,
             commands::list_archived_pages,
             commands::list_local_crawls,
+            commands::list_crawls,
+            commands::get_crawl_doc,
+            commands::rename_crawl,
             commands::get_page_content,
             commands::export_content,
             commands::deep_fetch_page,
             commands::reveal_in_explorer,
             commands::open_data_folder,
             commands::get_last_crawl_summary,
+            commands::preview_frontier,
+            commands::list_assets,
+            commands::export_logs,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

@@ -20,6 +20,7 @@ pub enum ExportScope {
     SinglePage,
     WholeCrawlOneFile,
     WholeCrawlFolder,
+    SelectedPages,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -39,6 +40,8 @@ pub struct ExportRequest {
     pub page_url: Option<String>,
     pub crawl_id: Option<String>,
     pub source: Option<crate::commands::StorageSource>,
+    pub output_name: Option<String>,
+    pub selected_urls: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -64,6 +67,7 @@ impl ExportRequest {
             ExportScope::SinglePage => "single_page".to_string(),
             ExportScope::WholeCrawlOneFile => "whole_crawl_one_file".to_string(),
             ExportScope::WholeCrawlFolder => "whole_crawl_folder".to_string(),
+            ExportScope::SelectedPages => "selected_pages".to_string(),
         }
     }
 
@@ -71,7 +75,7 @@ impl ExportRequest {
         match self.format {
             ExportFormat::Epub => {
                 match self.scope {
-                    ExportScope::SinglePage | ExportScope::WholeCrawlFolder => {
+                    ExportScope::SinglePage | ExportScope::WholeCrawlFolder | ExportScope::SelectedPages => {
                         return Err("EPUB only supports Whole Crawl as a single file".to_string());
                     }
                     _ => {}
@@ -84,6 +88,14 @@ impl ExportRequest {
             ExportScope::SinglePage => {
                 if self.page_url.is_none() || self.page_url.as_ref().unwrap().is_empty() {
                     return Err("Single page export requires a page_url".to_string());
+                }
+            }
+            ExportScope::SelectedPages => {
+                if self.selected_urls.is_none() || self.selected_urls.as_ref().map_or(true, |u| u.is_empty()) {
+                    return Err("Selected pages export requires at least one URL".to_string());
+                }
+                if self.crawl_id.is_none() || self.crawl_id.as_ref().unwrap().is_empty() {
+                    return Err("Selected pages export requires a crawl_id".to_string());
                 }
             }
             _ => {

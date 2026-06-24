@@ -1,6 +1,12 @@
 export type Engine = "local" | "cloud" | "local-scrapy";
 
-export type ArchiveStatus = "idle" | "crawling" | "paused" | "completed" | "error" | "cancelled";
+export type ArchiveStatus =
+  | "idle"
+  | "crawling"
+  | "paused"
+  | "completed"
+  | "error"
+  | "cancelled";
 
 export type PageStatus =
   | "Pending"
@@ -11,15 +17,17 @@ export type PageStatus =
   | { Failed: string }
   | { Skipped: string };
 
-export type ServiceState = "not_configured" | "configured_unverified" | "connected" | "unreachable";
+export type ServiceState =
+  | "not_configured"
+  | "configured_unverified"
+  | "connected"
+  | "unreachable";
 
 export type PersistTarget =
   | { mongo: { db: string; collection: string } }
   | { local_file: { path: string } };
 
-export type StorageSource =
-  | "Mongo"
-  | { LocalFile: { path: string } };
+export type StorageSource = "Mongo" | { LocalFile: { path: string } };
 
 export type StorageUsed =
   | "Mongo"
@@ -48,6 +56,7 @@ export interface CrawlConfig {
   css_selectors: string[];
   preserve_html: boolean;
   hash_algorithm: HashAlgorithm;
+  allowed_urls?: string[];
 }
 
 export interface AssetImage {
@@ -139,11 +148,32 @@ export interface CrawlStats {
   discovered: number;
 }
 
+export interface CrawlStatsSummary {
+  discovered: number;
+  archived: number;
+  failed: number;
+  skipped: number;
+  thin_count?: number;
+}
+
+export interface CrawlSummary {
+  crawl_id: string;
+  seed_url: string;
+  name: string | null;
+  source: Engine;
+  started_at: string;
+  finished_at: string | null;
+  stats: CrawlStatsSummary;
+  cancelled: boolean;
+  storage_used: StorageUsed | null;
+}
+
 export interface CrawlDonePayload {
   pages_archived: number;
   pages_completed: number;
   pages_failed: number;
   pages_skipped: number;
+  thin_count: number;
   cancelled: boolean;
   crawl_id: string;
   storage_used: StorageUsed | null;
@@ -172,6 +202,7 @@ export interface LogEntry {
   level: string;
   engine: string;
   message: string;
+  crawl_id?: string | null;
 }
 
 export interface PageSummary {
@@ -221,13 +252,22 @@ export interface PageStageEvent {
 
 export function storageSourceLabel(source: StorageSource): string {
   if (source === "Mongo") return "MongoDB";
-  if (typeof source === "object" && "LocalFile" in source) return `Local file: ${source.LocalFile.path}`;
+  if (typeof source === "object" && "LocalFile" in source)
+    return `Local file: ${source.LocalFile.path}`;
   return "Unknown";
 }
 
 export type ExportFormat = "plain_text" | "markdown" | "html" | "epub";
-export type ExportScope = "single_page" | "whole_crawl_one_file" | "whole_crawl_folder";
-export type ExportContent = "content_only" | "with_metadata" | "with_assets" | "full";
+export type ExportScope =
+  | "single_page"
+  | "whole_crawl_one_file"
+  | "whole_crawl_folder"
+  | "selected_pages";
+export type ExportContent =
+  | "content_only"
+  | "with_metadata"
+  | "with_assets"
+  | "full";
 
 export interface ExportRequest {
   format: ExportFormat;
@@ -236,6 +276,8 @@ export interface ExportRequest {
   pageUrl?: string;
   crawlId?: string;
   source?: StorageSource;
+  outputName?: string;
+  selectedUrls?: string[];
 }
 
 export interface ExportResult {
@@ -252,4 +294,17 @@ export function storageUsedLabel(su: StorageUsed): string {
     if ("Both" in su) return `MongoDB + Local file: ${su.Both.local_path}`;
   }
   return "Unknown";
+}
+
+export interface AssetRow {
+  asset_type: string;
+  src: string;
+  alt_or_link_text: string | null;
+  page_url: string;
+  in_main_content: boolean;
+}
+
+export interface FrontierPreviewResult {
+  total_count: number;
+  sample_urls: string[];
 }

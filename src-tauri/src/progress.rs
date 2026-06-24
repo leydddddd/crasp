@@ -14,7 +14,7 @@ pub struct CrawlPageDone {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum CrawlProgressEvent {
-    Log { level: String, engine: String, message: String },
+    Log { level: String, engine: String, message: String, crawl_id: Option<String> },
     PageDone(CrawlPageDone),
     Discover { url: String, depth: u32, parent: String },
 }
@@ -36,7 +36,8 @@ impl CliEmitter {
                 let level = payload.get("level").and_then(|v| v.as_str()).unwrap_or("info").to_string();
                 let engine = payload.get("engine").and_then(|v| v.as_str()).unwrap_or("local").to_string();
                 let message = payload.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                Some(CrawlProgressEvent::Log { level, engine, message })
+                let crawl_id = payload.get("crawl_id").and_then(|v| v.as_str()).map(String::from);
+                Some(CrawlProgressEvent::Log { level, engine, message, crawl_id })
             }
             "archive-success" | "archive-failed" => {
                 let url = payload.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();

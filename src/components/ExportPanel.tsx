@@ -1,52 +1,64 @@
-import { useState, useMemo, useCallback } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { FileDown, X, FolderOpen } from "lucide-react";
+import { FileDown, FolderOpen, X } from "lucide-react";
 import type {
-  ExportFormat,
-  ExportScope,
   ExportContent,
+  ExportFormat,
   ExportRequest,
   ExportResult,
+  ExportScope,
   PageSummary,
 } from "@/types/archiver";
 
 const FORMAT_OPTIONS: { value: ExportFormat; label: string }[] = [
   { value: "plain_text", label: "Plain Text" },
   { value: "markdown", label: "Markdown" },
-  { value: "html", label: "HTML" },
+  { value: "html", label: "Self-contained HTML" },
   { value: "epub", label: "EPUB" },
 ];
 
 const SCOPE_OPTIONS: { value: ExportScope; label: string }[] = [
-  { value: "single_page", label: "Single Page" },
-  { value: "whole_crawl_one_file", label: "One File" },
-  { value: "whole_crawl_folder", label: "Folder" },
+  { value: "single_page", label: "This page only" },
+  { value: "whole_crawl_one_file", label: "Entire session" },
+  { value: "whole_crawl_folder", label: "Session folder" },
+  { value: "selected_pages", label: "Selected pages" },
 ];
 
 const CONTENT_OPTIONS: { value: ExportContent; label: string }[] = [
-  { value: "content_only", label: "Content Only" },
-  { value: "with_metadata", label: "With Metadata" },
-  { value: "with_assets", label: "With Assets" },
+  { value: "content_only", label: "Content only" },
+  { value: "with_metadata", label: "With metadata" },
+  { value: "with_assets", label: "With assets" },
   { value: "full", label: "Full" },
 ];
 
 interface ExportPanelProps {
-  open: boolean;
-  onClose: () => void;
   context: "single_page" | "whole_crawl";
   page?: PageSummary | null;
   crawlId?: string | null;
+  crawlName?: string | null;
+  pageCount?: number | null;
+  selectedUrls?: string[];
+  onCancel: () => void;
 }
 
-export function ExportPanel({ open, onClose, context, page, crawlId }: ExportPanelProps) {
+export function ExportPanel({
+  context,
+  page,
+  crawlId,
+  crawlName,
+  pageCount,
+  selectedUrls,
+  onCancel,
+}: ExportPanelProps) {
   const [format, setFormat] = useState<ExportFormat>("plain_text");
   const [scope, setScope] = useState<ExportScope>(
-    context === "single_page" ? "single_page" : "whole_crawl_one_file"
+    context === "single_page" ? "single_page" : "whole_crawl_one_file",
   );
   const [content, setContent] = useState<ExportContent>("with_metadata");
   const [exporting, setExporting] = useState(false);
   const [result, setResult] = useState<ExportResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [outputName, setOutputName] = useState("");
 
   const isEpub = format === "epub";
 
@@ -57,19 +69,31 @@ export function ExportPanel({ open, onClose, context, page, crawlId }: ExportPan
     if (context === "single_page") {
       return SCOPE_OPTIONS.filter((s) => s.value === "single_page");
     }
-    return SCOPE_OPTIONS.filter((s) => s.value !== "single_page");
-  }, [isEpub, context]);
+    const scopes = SCOPE_OPTIONS.filter((s) => s.value !== "single_page");
+    if (!selectedUrls || selectedUrls.length === 0) {
+      return scopes.filter((s) => s.value !== "selected_pages");
+    }
+    return scopes;
+  }, [isEpub, context, selectedUrls]);
 
   const previewText = useMemo(() => {
-    let pages = 1;
-    if (scope !== "single_page") {
-      pages = 5; // rough page count estimate for preview display
-    }
+    const pages = scope === "single_page" ? 1 : scope === "selected_pages" ? (selectedUrls?.length || 0) : (pageCount || 0);
     const ext =
-      format === "plain_text" ? "txt" : format === "markdown" ? "md" : format === "html" ? "html" : "epub";
-    const filename = scope === "whole_crawl_folder" ? `export_folder/` : `export.${ext}`;
-    return `${pages} page${pages > 1 ? "s" : ""} → ${filename}`;
-  }, [format, scope]);
+      format === "plain_text"
+        ? "txt"
+        : format === "markdown"
+          ? "md"
+          : format === "html"
+            ? "html"
+            : "epub";
+    const baseName =
+      outputName || crawlName || page?.url?.replace(/^https?:\/\//, "") || "export";
+    const filename =
+      scope === "whole_crawl_folder"
+        ? `${baseName}-export/`
+        : `${baseName}.${ext}`;
+    return `${pages} page${pages === 1 ? "" : "s"} - ${filename}`;
+  }, [format, scope, pageCount, crawlName, page, selectedUrls, outputName]);
 
   const handleExport = useCallback(async () => {
     setExporting(true);
@@ -78,11 +102,13 @@ export function ExportPanel({ open, onClose, context, page, crawlId }: ExportPan
     try {
       const request: ExportRequest = {
         format,
-        scope,
+        scope: scope as "single_page" | "whole_crawl_one_file" | "whole_crawl_folder" | "selected_pages",
         content,
         pageUrl: context === "single_page" ? page?.url : undefined,
-        crawlId: context === "whole_crawl" ? crawlId || undefined : undefined,
+        crawlId: context === "whole_crawl" ? crawlId || undefined : crawlId || undefined,
         source: page?.source,
+        outputName: outputName || undefined,
+        selectedUrls: scope === "selected_pages" ? selectedUrls : undefined,
       };
       const res = await invoke<ExportResult>("export_content", { request });
       setResult(res);
@@ -91,7 +117,7 @@ export function ExportPanel({ open, onClose, context, page, crawlId }: ExportPan
     } finally {
       setExporting(false);
     }
-  }, [format, scope, content, context, page, crawlId]);
+  }, [format, scope, content, context, page, crawlId, selectedUrls, outputName]);
 
   const handleReveal = useCallback(async () => {
     if (result?.path) {
@@ -103,71 +129,115 @@ export function ExportPanel({ open, onClose, context, page, crawlId }: ExportPan
     }
   }, [result]);
 
-  if (!open) return null;
-
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-      <div className="w-full max-w-md rounded-lg border border-gray-700 bg-gray-900 p-6 shadow-xl">
-        <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-gray-100">Export Options</h2>
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-200">
-            <X className="h-5 w-5" />
-          </button>
+    <div className="flex h-full flex-col">
+      <div className="flex items-center justify-between border-b border-gray-800 px-6 py-4">
+        <div>
+          <h2 className="text-lg font-semibold text-gray-100">Export</h2>
+          <p className="text-xs text-gray-500">
+            Exporting: {context === "single_page" ? page?.url : crawlName}
+          </p>
         </div>
+        <button
+          onClick={onCancel}
+          className="text-gray-500 hover:text-gray-300"
+        >
+          <X className="h-5 w-5" />
+        </button>
+      </div>
 
-        <div className="space-y-4">
-          <div>
-            <label className="mb-1 block text-xs text-gray-500">Format</label>
-            <select
-              value={format}
-              onChange={(e) => setFormat(e.target.value as ExportFormat)}
-              className="w-full rounded-md border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-200 focus:border-crasp-500 focus:outline-none"
-            >
+      <div className="flex-1 overflow-auto px-6 py-6">
+        <div className="max-w-xl space-y-6">
+          <section className="rounded-lg border border-gray-800 bg-gray-900/50 p-5">
+            <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-gray-400">
+              Format
+            </h3>
+            <div className="space-y-2">
               {FORMAT_OPTIONS.map((opt) => (
-                <option key={opt.value} value={opt.value}>
+                <label
+                  key={opt.value}
+                  className="flex items-center gap-2 text-sm text-gray-300"
+                >
+                  <input
+                    type="radio"
+                    checked={format === opt.value}
+                    onChange={() => setFormat(opt.value)}
+                    className="h-3 w-3 text-crasp-600"
+                  />
                   {opt.label}
-                </option>
+                </label>
               ))}
-            </select>
-          </div>
+            </div>
+          </section>
 
-          <div>
-            <label className="mb-1 block text-xs text-gray-500">Scope</label>
-            <select
-              value={scope}
-              onChange={(e) => setScope(e.target.value as ExportScope)}
-              disabled={availableScopes.length === 1}
-              className="w-full rounded-md border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-200 focus:border-crasp-500 focus:outline-none disabled:opacity-50"
-            >
+          <section className="rounded-lg border border-gray-800 bg-gray-900/50 p-5">
+            <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-gray-400">
+              Scope
+            </h3>
+            <div className="space-y-2">
               {availableScopes.map((opt) => (
-                <option key={opt.value} value={opt.value}>
+                <label
+                  key={opt.value}
+                  className="flex items-center gap-2 text-sm text-gray-300"
+                >
+                  <input
+                    type="radio"
+                    checked={scope === opt.value}
+                    onChange={() => setScope(opt.value)}
+                    className="h-3 w-3 text-crasp-600"
+                  />
                   {opt.label}
-                </option>
+                </label>
               ))}
-            </select>
-          </div>
+            </div>
+          </section>
 
           {!isEpub && (
-            <div>
-              <label className="mb-1 block text-xs text-gray-500">Content</label>
-              <select
-                value={content}
-                onChange={(e) => setContent(e.target.value as ExportContent)}
-                className="w-full rounded-md border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-200 focus:border-crasp-500 focus:outline-none"
-              >
+            <section className="rounded-lg border border-gray-800 bg-gray-900/50 p-5">
+              <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-gray-400">
+                Content Level
+              </h3>
+              <div className="space-y-2">
                 {CONTENT_OPTIONS.map((opt) => (
-                  <option key={opt.value} value={opt.value}>
+                  <label
+                    key={opt.value}
+                    className="flex items-center gap-2 text-sm text-gray-300"
+                  >
+                    <input
+                      type="radio"
+                      checked={content === opt.value}
+                      onChange={() => setContent(opt.value)}
+                      className="h-3 w-3 text-crasp-600"
+                    />
                     {opt.label}
-                  </option>
+                  </label>
                 ))}
-              </select>
-            </div>
+              </div>
+            </section>
           )}
 
           {isEpub && (
             <p className="text-xs text-gray-500">
-              EPUB always includes metadata per chapter.
+              EPUB export always includes chapter metadata.
             </p>
+          )}
+
+          {scope !== "whole_crawl_folder" && (
+            <section className="rounded-lg border border-gray-800 bg-gray-900/50 p-5">
+              <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-gray-400">
+                Filename
+              </h3>
+              <input
+                type="text"
+                value={outputName}
+                onChange={(e) => setOutputName(e.target.value)}
+                placeholder="Auto-generated"
+                className="w-full rounded-md border border-gray-700 bg-gray-800 px-2.5 py-1.5 text-xs text-gray-200 placeholder-gray-600 focus:border-crasp-500 focus:outline-none"
+              />
+              <p className="mt-1 text-[11px] text-gray-500">
+                Leave empty for auto-generated name.
+              </p>
+            </section>
           )}
 
           <div className="rounded-md bg-gray-800 p-3 text-xs text-gray-400">
@@ -204,7 +274,7 @@ export function ExportPanel({ open, onClose, context, page, crawlId }: ExportPan
               Export
             </button>
             <button
-              onClick={onClose}
+              onClick={onCancel}
               className="rounded-md bg-gray-800 px-4 py-2 text-sm text-gray-300 hover:bg-gray-700 transition-colors"
             >
               Cancel

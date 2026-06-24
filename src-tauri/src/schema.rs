@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct CrawlDoc {
     pub crawl_id: String,
     pub seed_url: String,
+    pub name: Option<String>,
     pub config: CrawlConfigEmbedded,
     pub source: String,
     pub zyte_job_key: Option<String>,
@@ -11,6 +12,14 @@ pub struct CrawlDoc {
     pub finished_at: Option<String>,
     pub stats: CrawlStatsEmbedded,
     pub cancelled: bool,
+    pub storage_used: Option<StorageUsed>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StorageUsed {
+    Mongo,
+    LocalFile { path: String },
+    Both { local_path: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +30,8 @@ pub struct CrawlConfigEmbedded {
     pub css_selectors: Vec<String>,
     pub preserve_html: bool,
     pub hash_algorithm: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +40,8 @@ pub struct CrawlStatsEmbedded {
     pub archived: u32,
     pub failed: u32,
     pub skipped: u32,
+    #[serde(default)]
+    pub thin_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

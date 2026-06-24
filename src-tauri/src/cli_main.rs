@@ -238,6 +238,7 @@ async fn run_crawl(
         css_selectors: selectors.split(',').map(|s| s.trim().to_string()).collect(),
         preserve_html,
         hash_algorithm: hash_algo,
+        allowed_urls: Vec::new(),
     };
 
     let ctx = build_app_context(cli.mongo_uri.clone()).await;
@@ -681,6 +682,8 @@ async fn run_export(
         page_url: page_url.map(String::from),
         crawl_id: crawl_id.map(String::from),
         source: None,
+        output_name: None,
+        selected_urls: None,
     };
 
     if let Err(e) = request.is_valid() {
@@ -840,6 +843,10 @@ async fn run_export(
             }
 
             println!("{} Written to {} ({} files + index.{})", "✓".green().bold(), folder_path.to_string_lossy(), page_count, format_label);
+        }
+        ExportScope::SelectedPages => {
+            eprintln!("{} Selected pages export is only available in the GUI.", "✗".red().bold());
+            return 1;
         }
     }
 

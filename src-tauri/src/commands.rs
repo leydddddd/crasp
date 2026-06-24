@@ -5,10 +5,13 @@ use std::sync::Arc;
 use futures_util::TryStreamExt;
 use tauri::{AppHandle, Emitter, Manager};
 
+use url::Url;
+
 use crate::progress::CraspEmitter;
 use crate::crawler::{CrawlConfig, Crawler, CrawlControl, PageStage, PersistTarget};
-use crate::logging::emit_log;
+use crate::logging::{emit_log, emit_log_with_crawl_id};
 use crate::runtime::{AppContext, ServiceState, AppStatus as StoreAppStatus};
+use crate::schema::{CrawlDoc, CrawlConfigEmbedded, CrawlStatsEmbedded, StorageUsed};
 use crate::store;
 use crate::zyte::{ZyteClient, ZyteJobRequest, ZyteJobArguments, ZyteProgress, ZyteConnectionStatus};
 
@@ -41,6 +44,7 @@ pub struct SharedCrawlOutcomes {
     pub pages_completed: std::sync::atomic::AtomicU64,
     pub pages_failed: std::sync::atomic::AtomicU64,
     pub pages_skipped: std::sync::atomic::AtomicU64,
+    pub thin_count: std::sync::atomic::AtomicU64,
     pub used_mongo: std::sync::atomic::AtomicBool,
     pub local_file_path: parking_lot::Mutex<Option<String>>,
     pub deep_fetched_count: std::sync::atomic::AtomicU64,
@@ -76,6 +80,7 @@ impl SharedCrawlOutcomes {
         self.pages_completed.store(0, std::sync::atomic::Ordering::SeqCst);
         self.pages_failed.store(0, std::sync::atomic::Ordering::SeqCst);
         self.pages_skipped.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.thin_count.store(0, std::sync::atomic::Ordering::SeqCst);
         self.used_mongo.store(false, std::sync::atomic::Ordering::SeqCst);
         *self.local_file_path.lock() = None;
         self.deep_fetched_count.store(0, std::sync::atomic::Ordering::SeqCst);
@@ -95,6 +100,7 @@ impl SharedCrawlOutcomes {
             pages_completed: self.pages_completed.load(std::sync::atomic::Ordering::SeqCst),
             pages_failed: self.pages_failed.load(std::sync::atomic::Ordering::SeqCst),
             pages_skipped: self.pages_skipped.load(std::sync::atomic::Ordering::SeqCst),
+            thin_count: self.thin_count.load(std::sync::atomic::Ordering::SeqCst),
             cancelled,
             crawl_id: crawl_id.to_string(),
             storage_used,
@@ -252,7 +258,7 @@ pub async fn start_crawl(
     config: CrawlConfig,
     state: tauri::State<'_, CrawlState>,
     ctx: tauri::State<'_, Arc<AppContext>>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     if let Err(e) = crate::ssrf::validate_seed_url(&config.seed_url).await {
         let te = TauriEmitter::new(app);
         let emitter = CraspEmitter::Tauri(te);
@@ -268,6 +274,7 @@ pub async fn start_crawl(
     }
 
     let crawl_id = format!("crawl_{}", chrono::Utc::now().timestamp_millis());
+    let started_at = chrono::Utc::now().to_rfc3339();
     state.set_crawl_id(crawl_id.clone());
 
     let new_control = Arc::new(CrawlControl::new());
@@ -286,13 +293,24 @@ pub async fn start_crawl(
     let control = new_control;
     let ctx_arc = ctx.inner().clone();
 
+    let _ = record_crawl_start(
+        &ctx_arc,
+        &app_data_dir,
+        &crawl_id,
+        &config,
+        "local",
+        &started_at,
+    )
+    .await;
+
     control.reset();
 
     ctx.deep_fetch_queue.reset_counter();
 
-    let _ = emit_log(&emitter, "info", "local", &format!("Crawl started: id={}, seed={}", crawl_id, config.seed_url));
+    let _ = emit_log_with_crawl_id(&emitter, "info", "local", &format!("Crawl started: id={}, seed={}", crawl_id, config.seed_url), Some(crawl_id.clone()));
 
     let shared = state.outcomes_arc();
+    let crawl_id_return = crawl_id.clone();
 
     let handle = tokio::spawn(async move {
         let crawler = Crawler::new();
@@ -308,6 +326,8 @@ pub async fn start_crawl(
 
         shared.deep_fetched_count.store(deep_fetched, std::sync::atomic::Ordering::SeqCst);
         let summary = shared.build_crawl_done_summary(pages_archived, cancelled_flag, &crawl_id);
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        let _ = record_crawl_done(&ctx_arc, &app_data_dir, &crawl_id, &summary, &finished_at).await;
 
         let _ = emitter.emit("crawl-done", &serde_json::to_value(&summary).unwrap_or_default()).await;
 
@@ -319,7 +339,7 @@ pub async fn start_crawl(
         *h = Some(handle.abort_handle());
     }
 
-    Ok(())
+    Ok(crawl_id_return)
 }
 
 #[tauri::command]
@@ -330,7 +350,7 @@ pub async fn start_cloud_crawl(
     project_id: String,
     state: tauri::State<'_, CrawlState>,
     ctx: tauri::State<'_, Arc<AppContext>>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     if let Err(e) = crate::ssrf::validate_seed_url(&config.seed_url).await {
         let te = TauriEmitter::new(app);
         let emitter = CraspEmitter::Tauri(te);
@@ -365,6 +385,7 @@ pub async fn start_cloud_crawl(
     }
 
     let crawl_id = format!("crawl_{}", chrono::Utc::now().timestamp_millis());
+    let started_at = chrono::Utc::now().to_rfc3339();
     state.set_crawl_id(crawl_id.clone());
 
     let new_control = Arc::new(CrawlControl::new());
@@ -382,11 +403,22 @@ pub async fn start_cloud_crawl(
     let emitter = CraspEmitter::Tauri(TauriEmitter::new(app));
     let ctx_arc = ctx.inner().clone();
 
+    let _ = record_crawl_start(
+        &ctx_arc,
+        &app_data_dir,
+        &crawl_id,
+        &config,
+        "cloud",
+        &started_at,
+    )
+    .await;
+
     ctx.deep_fetch_queue.reset_counter();
 
-    let _ = emit_log(&emitter, "info", "cloud", &format!("Cloud crawl started: id={}, seed={}", crawl_id, config.seed_url));
+    let _ = emit_log_with_crawl_id(&emitter, "info", "cloud", &format!("Cloud crawl started: id={}, seed={}", crawl_id, config.seed_url), Some(crawl_id.clone()));
 
     let shared = state.outcomes_arc();
+    let crawl_id_return = crawl_id.clone();
 
     let handle = tokio::spawn(async move {
         let _control = new_control;
@@ -423,13 +455,15 @@ pub async fn start_cloud_crawl(
         let job_key = match client.run_job(&job_req).await {
             Ok(k) => k,
             Err(e) => {
-                let _ = emit_log(&emitter, "error", "cloud", &format!("Zyte job submit failed: {}", e));
+        let _ = emit_log_with_crawl_id(&emitter, "error", "cloud", &format!("Zyte job submit failed: {}", e), Some(crawl_id.clone()));
                 let _ = emitter.emit("page-stage", &serde_json::json!({
                     "url": config.seed_url,
                     "crawl_id": crawl_id,
                     "stage": PageStage::Failed { failed_stage: "zyte_submit".to_string(), reason: e.clone() },
                 })).await;
                 let summary = shared.build_crawl_done_summary(0, false, &crawl_id);
+                let finished_at = chrono::Utc::now().to_rfc3339();
+                let _ = record_crawl_done(&ctx_arc, &app_data_dir, &crawl_id, &summary, &finished_at).await;
                 let _ = emitter.emit("crawl-done", &serde_json::to_value(&summary).unwrap_or_default()).await;
                 return;
             }
@@ -456,13 +490,15 @@ pub async fn start_cloud_crawl(
 
         if let Err(e) = wait_task.await.unwrap_or(Err("join error".to_string())) {
             let _ = progress_emitter.await;
-            let _ = emit_log(&emitter, "error", "cloud", &format!("Zyte job wait failed: {}", e));
+            let _ = emit_log_with_crawl_id(&emitter, "error", "cloud", &format!("Zyte job wait failed: {}", e), Some(crawl_id.clone()));
             let _ = emitter.emit("page-stage", &serde_json::json!({
                 "url": config.seed_url,
                 "crawl_id": crawl_id,
                 "stage": PageStage::Failed { failed_stage: "zyte_wait".to_string(), reason: e.clone() },
             })).await;
             let summary = shared.build_crawl_done_summary(0, false, &crawl_id);
+            let finished_at = chrono::Utc::now().to_rfc3339();
+            let _ = record_crawl_done(&ctx_arc, &app_data_dir, &crawl_id, &summary, &finished_at).await;
             let _ = emitter.emit("crawl-done", &serde_json::to_value(&summary).unwrap_or_default()).await;
             return;
         }
@@ -552,6 +588,8 @@ pub async fn start_cloud_crawl(
         let count = items_emitter.await.unwrap_or(0);
 
         let summary = shared.build_crawl_done_summary(count, false, &crawl_id);
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        let _ = record_crawl_done(&ctx_arc, &app_data_dir, &crawl_id, &summary, &finished_at).await;
         let _ = emitter.emit("crawl-done", &serde_json::to_value(&summary).unwrap_or_default()).await;
     });
 
@@ -560,7 +598,7 @@ pub async fn start_cloud_crawl(
         *h = Some(handle.abort_handle());
     }
 
-    Ok(())
+    Ok(crawl_id_return)
 }
 
 pub async fn emit_persist_stages(
@@ -605,6 +643,9 @@ pub async fn emit_persist_stages(
                 PersistOutcome::Mongo { .. } => {
                     s.used_mongo.store(true, std::sync::atomic::Ordering::SeqCst);
                     s.pages_completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if item.get("thin_content").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        s.thin_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
                 PersistOutcome::LocalFile { path } => {
                     let mut lp = s.local_file_path.lock();
@@ -613,6 +654,9 @@ pub async fn emit_persist_stages(
                     }
                     drop(lp);
                     s.pages_completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if item.get("thin_content").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        s.thin_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
                 PersistOutcome::Failed { .. } => {}
             }
@@ -638,7 +682,7 @@ pub async fn local_scrapy_crawl(
     config: CrawlConfig,
     state: tauri::State<'_, CrawlState>,
     ctx: tauri::State<'_, Arc<AppContext>>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     if let Err(e) = crate::ssrf::validate_seed_url(&config.seed_url).await {
         let te = TauriEmitter::new(app);
         let emitter = CraspEmitter::Tauri(te);
@@ -654,6 +698,7 @@ pub async fn local_scrapy_crawl(
     }
 
     let crawl_id = format!("crawl_{}", chrono::Utc::now().timestamp_millis());
+    let started_at = chrono::Utc::now().to_rfc3339();
     state.set_crawl_id(crawl_id.clone());
 
     let new_control = Arc::new(CrawlControl::new());
@@ -675,10 +720,21 @@ pub async fn local_scrapy_crawl(
 
     let emitter = CraspEmitter::Tauri(TauriEmitter::new(app));
 
-    let _ = emit_log(&emitter, "info", "local-scrapy", &format!("Local-Scrapy crawl started: id={}, seed={}", crawl_id, config.seed_url));
+    let _ = record_crawl_start(
+        &ctx_arc,
+        &app_data_dir,
+        &crawl_id,
+        &config,
+        "local-scrapy",
+        &started_at,
+    )
+    .await;
+
+    let _ = emit_log_with_crawl_id(&emitter, "info", "local-scrapy", &format!("Local-Scrapy crawl started: id={}, seed={}", crawl_id, config.seed_url), Some(crawl_id.clone()));
 
     let out_path = format!("{}/crasp_{}.jl", app_data_dir, chrono::Utc::now().timestamp());
     let shared = state.outcomes_arc();
+    let crawl_id_return = crawl_id.clone();
 
     let handle = tokio::spawn(async move {
         let result = crate::local_scrapy::run_local_spider_streaming(
@@ -698,6 +754,8 @@ pub async fn local_scrapy_crawl(
         };
 
         let summary = shared.build_crawl_done_summary(pages_archived, cancelled, &crawl_id);
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        let _ = record_crawl_done(&ctx_arc, &app_data_dir, &crawl_id, &summary, &finished_at).await;
         let _ = emitter.emit("crawl-done", &serde_json::to_value(&summary).unwrap_or_default()).await;
 
         let _ = result;
@@ -708,7 +766,7 @@ pub async fn local_scrapy_crawl(
         *h = Some(handle.abort_handle());
     }
 
-    Ok(())
+    Ok(crawl_id_return)
 }
 
 #[tauri::command]
@@ -870,10 +928,235 @@ pub struct LocalCrawlSummary {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub enum StorageUsed {
-    Mongo,
-    LocalFile { path: String },
-    Both { local_path: String },
+pub struct CrawlSummary {
+    pub crawl_id: String,
+    pub seed_url: String,
+    pub name: Option<String>,
+    pub source: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub stats: CrawlStatsEmbedded,
+    pub cancelled: bool,
+    pub storage_used: Option<StorageUsed>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LocalCrawlMeta {
+    pub crawl_id: String,
+    pub seed_url: String,
+    pub name: Option<String>,
+    pub source: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub stats: CrawlStatsEmbedded,
+    pub cancelled: bool,
+    pub storage_used: Option<StorageUsed>,
+}
+
+fn local_meta_path(app_data_dir: &str, crawl_id: &str) -> PathBuf {
+    PathBuf::from(app_data_dir).join(format!("crawl-{}.meta.json", crawl_id))
+}
+
+fn write_local_meta(app_data_dir: &str, meta: &LocalCrawlMeta) -> Result<(), String> {
+    let path = local_meta_path(app_data_dir, &meta.crawl_id);
+    let json = serde_json::to_string_pretty(meta)
+        .map_err(|e| format!("Failed to serialize crawl meta: {}", e))?;
+    std::fs::write(&path, json)
+        .map_err(|e| format!("Failed to write crawl meta {:?}: {}", path, e))?;
+    Ok(())
+}
+
+fn load_local_metas(app_data_dir: &str) -> Vec<LocalCrawlMeta> {
+    let dir = PathBuf::from(app_data_dir);
+    let read_dir = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut metas = Vec::new();
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let filename = match path.file_name() {
+            Some(n) => n.to_string_lossy().to_string(),
+            None => continue,
+        };
+        if !filename.starts_with("crawl-") || !filename.ends_with(".meta.json") {
+            continue;
+        }
+
+        let json = match std::fs::read_to_string(&path) {
+            Ok(j) => j,
+            Err(_) => continue,
+        };
+        if let Ok(meta) = serde_json::from_str::<LocalCrawlMeta>(&json) {
+            metas.push(meta);
+        }
+    }
+
+    metas
+}
+
+fn config_to_embedded(config: &CrawlConfig) -> CrawlConfigEmbedded {
+    let hash_algorithm = match config.hash_algorithm {
+        crate::crawler::HashAlgorithm::Md5 => "md5",
+        crate::crawler::HashAlgorithm::Sha256 => "sha256",
+    };
+    CrawlConfigEmbedded {
+        max_depth: config.max_depth,
+        max_pages: config.max_pages,
+        concurrency: config.concurrency,
+        css_selectors: config.css_selectors.clone(),
+        preserve_html: config.preserve_html,
+        hash_algorithm: hash_algorithm.to_string(),
+        allowed_urls: config.allowed_urls.clone(),
+    }
+}
+
+async fn record_crawl_start(
+    ctx: &Arc<AppContext>,
+    app_data_dir: &str,
+    crawl_id: &str,
+    config: &CrawlConfig,
+    source: &str,
+    started_at: &str,
+) -> Result<(), String> {
+    let stats = CrawlStatsEmbedded {
+        discovered: 0,
+        archived: 0,
+        failed: 0,
+        skipped: 0,
+        thin_count: 0,
+    };
+
+    let meta = LocalCrawlMeta {
+        crawl_id: crawl_id.to_string(),
+        seed_url: config.seed_url.clone(),
+        name: None,
+        source: source.to_string(),
+        started_at: started_at.to_string(),
+        finished_at: None,
+        stats: stats.clone(),
+        cancelled: false,
+        storage_used: None,
+    };
+    let _ = write_local_meta(app_data_dir, &meta);
+
+    if let Some(store) = &ctx.store {
+        let doc = CrawlDoc {
+            crawl_id: crawl_id.to_string(),
+            seed_url: config.seed_url.clone(),
+            name: None,
+            config: config_to_embedded(config),
+            source: source.to_string(),
+            zyte_job_key: None,
+            started_at: started_at.to_string(),
+            finished_at: None,
+            stats,
+            cancelled: false,
+            storage_used: None,
+        };
+        let filter = mongodb::bson::doc! { "crawl_id": crawl_id };
+        let options = mongodb::options::ReplaceOptions::builder().upsert(true).build();
+        store
+            .crawls_col()
+            .replace_one(filter, doc)
+            .with_options(options)
+            .await
+            .map_err(|e| format!("Failed to persist crawl start: {}", e))?;
+    }
+
+    Ok(())
+}
+
+async fn record_crawl_done(
+    ctx: &Arc<AppContext>,
+    app_data_dir: &str,
+    crawl_id: &str,
+    summary: &CrawlDoneSummary,
+    finished_at: &str,
+) -> Result<(), String> {
+    let stats = CrawlStatsEmbedded {
+        discovered: summary.pages_archived as u32,
+        archived: summary.pages_completed as u32,
+        failed: summary.pages_failed as u32,
+        skipped: summary.pages_skipped as u32,
+        thin_count: summary.thin_count as u32,
+    };
+
+    let meta = LocalCrawlMeta {
+        crawl_id: crawl_id.to_string(),
+        seed_url: String::new(),
+        name: None,
+        source: String::new(),
+        started_at: String::new(),
+        finished_at: Some(finished_at.to_string()),
+        stats: stats.clone(),
+        cancelled: summary.cancelled,
+        storage_used: summary.storage_used.clone(),
+    };
+
+    let mut updated_meta = meta;
+    let path = local_meta_path(app_data_dir, crawl_id);
+    if let Some(existing) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|json| serde_json::from_str::<LocalCrawlMeta>(&json).ok())
+    {
+        updated_meta.seed_url = if existing.seed_url.is_empty() { updated_meta.seed_url } else { existing.seed_url };
+        updated_meta.name = existing.name.or(updated_meta.name);
+        updated_meta.source = if existing.source.is_empty() { updated_meta.source } else { existing.source };
+        updated_meta.started_at = if existing.started_at.is_empty() { updated_meta.started_at } else { existing.started_at };
+    }
+    let _ = write_local_meta(app_data_dir, &updated_meta);
+
+    if let Some(store) = &ctx.store {
+        let filter = mongodb::bson::doc! { "crawl_id": crawl_id };
+        let storage_bson = mongodb::bson::to_bson(&summary.storage_used).unwrap_or(mongodb::bson::Bson::Null);
+        let update = mongodb::bson::doc! {
+            "$set": {
+                "finished_at": finished_at,
+                "stats": mongodb::bson::to_document(&stats).unwrap_or_default(),
+                "cancelled": summary.cancelled,
+                "storage_used": storage_bson,
+            }
+        };
+        let options = mongodb::options::UpdateOptions::builder().upsert(true).build();
+        store
+            .crawls_col()
+            .update_one(filter, update)
+            .with_options(options)
+            .await
+            .map_err(|e| format!("Failed to persist crawl completion: {}", e))?;
+    }
+
+    Ok(())
+}
+
+fn crawl_doc_to_summary(doc: CrawlDoc) -> CrawlSummary {
+    CrawlSummary {
+        crawl_id: doc.crawl_id,
+        seed_url: doc.seed_url,
+        name: doc.name,
+        source: doc.source,
+        started_at: doc.started_at,
+        finished_at: doc.finished_at,
+        stats: doc.stats,
+        cancelled: doc.cancelled,
+        storage_used: doc.storage_used,
+    }
+}
+
+fn crawl_meta_to_summary(meta: LocalCrawlMeta) -> CrawlSummary {
+    CrawlSummary {
+        crawl_id: meta.crawl_id,
+        seed_url: meta.seed_url,
+        name: meta.name,
+        source: meta.source,
+        started_at: meta.started_at,
+        finished_at: meta.finished_at,
+        stats: meta.stats,
+        cancelled: meta.cancelled,
+        storage_used: meta.storage_used,
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -882,6 +1165,7 @@ pub struct CrawlDoneSummary {
     pub pages_completed: u64,
     pub pages_failed: u64,
     pub pages_skipped: u64,
+    pub thin_count: u64,
     pub cancelled: bool,
     pub crawl_id: String,
     pub storage_used: Option<StorageUsed>,
@@ -1138,6 +1422,158 @@ pub async fn list_local_crawls(
     .map_err(|e| format!("spawn_blocking panic: {}", e))?;
 
     Ok(entries)
+}
+
+#[tauri::command]
+pub async fn list_crawls(
+    ctx: tauri::State<'_, Arc<AppContext>>,
+    app: AppHandle,
+) -> Result<Vec<CrawlSummary>, String> {
+    let mut by_id: std::collections::HashMap<String, CrawlSummary> =
+        std::collections::HashMap::new();
+
+    if let Some(store) = &ctx.store {
+        let find_options = mongodb::options::FindOptions::builder()
+            .sort(mongodb::bson::doc! { "started_at": -1 })
+            .build();
+        let mut cursor = store
+            .crawls_col()
+            .find(mongodb::bson::doc! {})
+            .with_options(find_options)
+            .await
+            .map_err(|e| format!("Mongo query failed: {}", e))?;
+
+        while let Some(doc) = cursor
+            .try_next()
+            .await
+            .map_err(|e| format!("Cursor error: {}", e))?
+        {
+            let summary = crawl_doc_to_summary(doc);
+            by_id.insert(summary.crawl_id.clone(), summary);
+        }
+    }
+
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+
+    for meta in load_local_metas(&app_data_dir) {
+        let summary = crawl_meta_to_summary(meta);
+        let summary_storage = summary.storage_used.clone();
+        let summary_name = summary.name.clone();
+        let entry = by_id.entry(summary.crawl_id.clone()).or_insert(summary);
+        if entry.storage_used.is_none() {
+            entry.storage_used = summary_storage;
+        }
+        if entry.name.is_none() {
+            entry.name = summary_name;
+        }
+    }
+
+    let mut results: Vec<CrawlSummary> = by_id.into_values().collect();
+    results.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    Ok(results)
+}
+
+#[tauri::command]
+pub async fn get_crawl_doc(
+    crawl_id: String,
+    ctx: tauri::State<'_, Arc<AppContext>>,
+    app: AppHandle,
+) -> Result<Option<CrawlSummary>, String> {
+    if let Some(store) = &ctx.store {
+        let filter = mongodb::bson::doc! { "crawl_id": &crawl_id };
+        if let Some(doc) = store
+            .crawls_col()
+            .find_one(filter)
+            .await
+            .map_err(|e| format!("Mongo query failed: {}", e))?
+        {
+            return Ok(Some(crawl_doc_to_summary(doc)));
+        }
+    }
+
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    let path = local_meta_path(&app_data_dir, &crawl_id);
+    if let Ok(json) = std::fs::read_to_string(&path) {
+        if let Ok(meta) = serde_json::from_str::<LocalCrawlMeta>(&json) {
+            return Ok(Some(crawl_meta_to_summary(meta)));
+        }
+    }
+
+    Ok(None)
+}
+
+#[tauri::command]
+pub async fn rename_crawl(
+    crawl_id: String,
+    name: Option<String>,
+    ctx: tauri::State<'_, Arc<AppContext>>,
+    app: AppHandle,
+) -> Result<(), String> {
+    if let Some(store) = &ctx.store {
+        let filter = mongodb::bson::doc! { "crawl_id": &crawl_id };
+        let update = mongodb::bson::doc! { "$set": { "name": name.clone() } };
+        store
+            .crawls_col()
+            .update_one(filter, update)
+            .await
+            .map_err(|e| format!("Mongo update failed: {}", e))?;
+    }
+
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    let path = local_meta_path(&app_data_dir, &crawl_id);
+    let mut meta = if let Ok(json) = std::fs::read_to_string(&path) {
+        serde_json::from_str::<LocalCrawlMeta>(&json).unwrap_or(LocalCrawlMeta {
+            crawl_id: crawl_id.clone(),
+            seed_url: String::new(),
+            name: None,
+            source: String::new(),
+            started_at: String::new(),
+            finished_at: None,
+            stats: CrawlStatsEmbedded {
+                discovered: 0,
+                archived: 0,
+                failed: 0,
+                skipped: 0,
+                thin_count: 0,
+            },
+            cancelled: false,
+            storage_used: None,
+        })
+    } else {
+        LocalCrawlMeta {
+            crawl_id: crawl_id.clone(),
+            seed_url: String::new(),
+            name: None,
+            source: String::new(),
+            started_at: String::new(),
+            finished_at: None,
+            stats: CrawlStatsEmbedded {
+                discovered: 0,
+                archived: 0,
+                failed: 0,
+                skipped: 0,
+                thin_count: 0,
+            },
+            cancelled: false,
+            storage_used: None,
+        }
+    };
+    meta.name = name;
+    let _ = write_local_meta(&app_data_dir, &meta);
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -1438,6 +1874,15 @@ async fn get_page_doc(
 
 
 
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .collect::<String>()
+        .chars()
+        .take(80)
+        .collect()
+}
+
 #[tauri::command]
 pub async fn export_content(
     request: crate::export::ExportRequest,
@@ -1483,16 +1928,22 @@ pub async fn export_content(
                 }
             };
 
-            let slug: String = page_url
-                .split('/')
-                .filter(|s| !s.is_empty() && *s != "http:" && *s != "https:")
-                .last()
-                .unwrap_or("page")
-                .chars()
-                .take(30)
-                .collect();
             let ts = chrono::Utc::now().timestamp_millis();
-            let filename = format!("{}_{}.{}_{}_{}", slug, ts, ext, request.format_string(), request.scope_string());
+            let filename = if let Some(ref oname) = request.output_name {
+                let sanitized = sanitize_filename(oname);
+                let has_ext = sanitized.rsplit('.').next().map(|e| e == ext).unwrap_or(false);
+                if has_ext { sanitized } else { format!("{}.{}", sanitized, ext) }
+            } else {
+                let slug: String = page_url
+                    .split('/')
+                    .filter(|s| !s.is_empty() && *s != "http:" && *s != "https:")
+                    .last()
+                    .unwrap_or("page")
+                    .chars()
+                    .take(30)
+                    .collect();
+                format!("{}_{}.{}_{}_{}", slug, ts, ext, request.format_string(), request.scope_string())
+            };
             let path = exports_dir.join(&filename);
             let mut file = std::fs::File::create(&path)
                 .map_err(|e| format!("Failed to create file: {}", e))?;
@@ -1502,6 +1953,74 @@ pub async fn export_content(
             Ok(crate::export::ExportResult {
                 path: path.to_string_lossy().to_string(),
                 page_count: 1,
+                format: request.format_string(),
+                scope: request.scope_string(),
+            })
+        }
+        crate::export::ExportScope::SelectedPages => {
+            let crawl_id = request.crawl_id.as_ref().unwrap().clone();
+            let selected_urls: std::collections::HashSet<String> = request.selected_urls.as_ref().unwrap().iter().cloned().collect();
+            let mut page_docs: Vec<crate::schema::PageDoc> = Vec::new();
+
+            if let Some(store) = &ctx.store {
+                let filter = mongodb::bson::doc! { "crawl_id": &crawl_id };
+                let mut cursor = store
+                    .pages_col()
+                    .find(filter)
+                    .await
+                    .map_err(|e| format!("Mongo query failed: {}", e))?;
+
+                while let Some(doc) = cursor
+                    .try_next()
+                    .await
+                    .map_err(|e| format!("Cursor error: {}", e))?
+                {
+                    if selected_urls.contains(&doc.url) {
+                        page_docs.push(doc);
+                    }
+                }
+            }
+
+            if page_docs.is_empty() {
+                return Err("No selected pages found for this crawl".to_string());
+            }
+
+            page_docs.sort_by(|a, b| a.depth.cmp(&b.depth).then(a.url.cmp(&b.url)));
+            let page_count = page_docs.len();
+
+            let (ext, content) = match request.format {
+                crate::export::ExportFormat::PlainText => (
+                    "txt",
+                    crate::export::pages_to_plain_text_combined(&page_docs, &request.content),
+                ),
+                crate::export::ExportFormat::Markdown => (
+                    "md",
+                    crate::export::pages_to_markdown_combined(&page_docs, &request.content),
+                ),
+                crate::export::ExportFormat::Html => (
+                    "html",
+                    crate::export::pages_to_html_combined(&page_docs, &request.content),
+                ),
+                _ => return Err("Unsupported format for selected pages export".to_string()),
+            };
+
+            let ts = chrono::Utc::now().timestamp_millis();
+            let filename = if let Some(ref oname) = request.output_name {
+                let sanitized = sanitize_filename(oname);
+                let has_ext = sanitized.rsplit('.').next().map(|e| e == ext).unwrap_or(false);
+                if has_ext { sanitized } else { format!("{}.{}", sanitized, ext) }
+            } else {
+                format!("{}_{}_selected_{}", crawl_id, ext, ts)
+            };
+            let path = exports_dir.join(&filename);
+            let mut file = std::fs::File::create(&path)
+                .map_err(|e| format!("Failed to create file: {}", e))?;
+            file.write_all(content.as_bytes())
+                .map_err(|e| format!("Failed to write file: {}", e))?;
+
+            Ok(crate::export::ExportResult {
+                path: path.to_string_lossy().to_string(),
+                page_count,
                 format: request.format_string(),
                 scope: request.scope_string(),
             })
@@ -1678,7 +2197,13 @@ pub async fn export_content(
                             };
 
                             let ts = chrono::Utc::now().timestamp_millis();
-                            let filename = format!("{}_{}_{}_{}", crawl_id, ext, ts, request.scope_string());
+                            let filename = if let Some(ref oname) = request.output_name {
+                                let sanitized = sanitize_filename(oname);
+                                let has_ext = sanitized.rsplit('.').next().map(|e| e == ext).unwrap_or(false);
+                                if has_ext { sanitized } else { format!("{}.{}", sanitized, ext) }
+                            } else {
+                                format!("{}_{}_{}_{}", crawl_id, ext, ts, request.scope_string())
+                            };
                             let path = exports_dir.join(&filename);
                             let mut file = std::fs::File::create(&path)
                                 .map_err(|e| format!("Failed to create file: {}", e))?;
@@ -1804,7 +2329,7 @@ pub async fn deep_fetch_page(
         browser.close();
 
         let emitter = CraspEmitter::Tauri(TauriEmitter::new(app));
-        let _ = emit_log(
+        let _ = emit_log_with_crawl_id(
             &emitter,
             "info",
             "local",
@@ -1812,6 +2337,7 @@ pub async fn deep_fetch_page(
                 "Manual deep fetch (browser) complete for {} — method={}, confidence={:.2}, thin={}, duration={}ms",
                 url, method_label, extraction.confidence, extraction.thin_content, duration_ms
             ),
+            Some(crawl_id.clone()),
         )
         .await;
 
@@ -1911,7 +2437,7 @@ pub async fn deep_fetch_page(
         }
 
         let emitter = CraspEmitter::Tauri(TauriEmitter::new(app));
-        let _ = emit_log(
+        let _ = emit_log_with_crawl_id(
             &emitter,
             "info",
             "local",
@@ -1919,6 +2445,7 @@ pub async fn deep_fetch_page(
                 "Manual deep fetch complete for {} — method={}, confidence={:.2}, thin={}",
                 url, extraction.method, extraction.confidence, extraction.thin_content
             ),
+            Some(crawl_id.clone()),
         )
         .await;
 
@@ -2005,4 +2532,161 @@ pub fn get_last_crawl_summary(
         false,
         &cid,
     )))
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FrontierPreviewResult {
+    pub total_count: u32,
+    pub sample_urls: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn preview_frontier(
+    seed_url: String,
+    max_pages: u32,
+    max_depth: Option<u32>,
+) -> Result<FrontierPreviewResult, String> {
+    let _ = crate::ssrf::validate_seed_url(&seed_url).await?;
+
+    let _effective_depth = max_depth.unwrap_or(1).min(max_pages);
+    let client = crate::ssrf::build_safe_http_client();
+
+    let response = client.get(&seed_url).send().await.map_err(|e| format!("Fetch failed: {}", e))?;
+    let initial_url = Url::parse(&seed_url).map_err(|e| format!("Invalid seed URL: {}", e))?;
+    let response = crate::ssrf::follow_redirects(&client, initial_url, response).await?;
+
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+
+    let html_text = response.text().await.map_err(|e| format!("Body read failed: {}", e))?;
+
+    let seed_url_clone = seed_url.clone();
+    let cap = max_pages as usize;
+    let (links, total_discovered) = tokio::task::spawn_blocking(move || {
+        let document = scraper::Html::parse_document(&html_text);
+        let all_links = crate::crawler::extract_links(&document, &seed_url_clone);
+
+        let seed = url::Url::parse(&seed_url_clone).ok();
+        let domain = seed.as_ref().and_then(|u| u.domain()).unwrap_or("").to_string();
+        let scheme = seed.as_ref().map(|u| u.scheme()).unwrap_or("https").to_string();
+
+        let mut seen = std::collections::HashSet::<String>::new();
+        let mut filtered = Vec::new();
+
+        for link in &all_links {
+            if let Ok(parsed) = url::Url::parse(link) {
+                if parsed.domain().map(|d| d == domain.as_str()) != Some(true) {
+                    continue;
+                }
+                if parsed.scheme() != scheme {
+                    continue;
+                }
+                let mut fragless = parsed.clone();
+                fragless.set_fragment(None);
+                let key = crate::crawler::normalize_url(&fragless.to_string());
+                if seen.insert(key.clone()) {
+                    filtered.push(key);
+                }
+            }
+        }
+
+        let total = filtered.len() as u32;
+        let sample: Vec<String> = filtered.into_iter().take(cap).collect();
+        (sample, total)
+    }).await.map_err(|e| format!("spawn_blocking panic: {}", e))?;
+
+    Ok(FrontierPreviewResult {
+        total_count: total_discovered,
+        sample_urls: links,
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AssetRow {
+    pub asset_type: String,
+    pub src: String,
+    pub alt_or_link_text: Option<String>,
+    pub page_url: String,
+    pub in_main_content: bool,
+}
+
+#[tauri::command]
+pub async fn list_assets(
+    crawl_id: String,
+    ctx: tauri::State<'_, Arc<AppContext>>,
+    app: AppHandle,
+) -> Result<Vec<AssetRow>, String> {
+    let pages = list_archived_pages(Some(crawl_id.clone()), ctx, app).await?;
+
+    let mut assets = Vec::new();
+    for page in pages {
+        if let Some(ref pa) = page.assets {
+            for img in &pa.images {
+                assets.push(AssetRow {
+                    asset_type: "image".to_string(),
+                    src: img.src.clone(),
+                    alt_or_link_text: img.alt.clone(),
+                    page_url: page.url.clone(),
+                    in_main_content: img.in_main_content,
+                });
+            }
+            for vid in &pa.videos {
+                assets.push(AssetRow {
+                    asset_type: "video".to_string(),
+                    src: vid.src.clone(),
+                    alt_or_link_text: vid.video_id.clone(),
+                    page_url: page.url.clone(),
+                    in_main_content: vid.in_main_content,
+                });
+            }
+            for doc in &pa.documents {
+                assets.push(AssetRow {
+                    asset_type: "document".to_string(),
+                    src: doc.src.clone(),
+                    alt_or_link_text: doc.link_text.clone(),
+                    page_url: page.url.clone(),
+                    in_main_content: doc.in_main_content,
+                });
+            }
+        }
+    }
+
+    Ok(assets)
+}
+
+#[tauri::command]
+pub async fn export_logs(
+    logs_json: String,
+    app: AppHandle,
+) -> Result<String, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+
+    let exports_dir = std::path::PathBuf::from(&app_data_dir).join("exports");
+    std::fs::create_dir_all(&exports_dir)
+        .map_err(|e| format!("Failed to create exports dir: {}", e))?;
+
+    let ts = chrono::Utc::now().timestamp_millis();
+    let filename = format!("logs_{}.txt", ts);
+    let path = exports_dir.join(&filename);
+
+    let entries: Vec<crate::logging::LogEntry> = serde_json::from_str(&logs_json)
+        .map_err(|e| format!("Invalid log JSON: {}", e))?;
+
+    let mut content = String::new();
+    for entry in &entries {
+        content.push_str(&format!(
+            "[{}] [{}] [{}] {}\n",
+            entry.timestamp, entry.level, entry.engine, entry.message
+        ));
+    }
+
+    std::fs::write(&path, content)
+        .map_err(|e| format!("Write failed: {}", e))?;
+
+    Ok(path.to_string_lossy().to_string())
 }
